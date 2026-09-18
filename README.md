@@ -48,6 +48,7 @@ GET/PUT/DELETE /api/admin/providers/{id}
 POST           /api/admin/providers/{id}/test
 GET/POST       /api/admin/model-routes
 GET/PUT/DELETE /api/admin/model-routes/{id}
+GET            /api/admin/logs?date=YYYY-MM-DD&q=keyword&limit=100
 GET            /api/admin/access
 GET            /v1/models
 GET            /healthz

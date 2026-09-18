@@ -339,6 +339,38 @@ class CallLogger:
         except queue.Full:
             self._write(record)
 
+    def list_days(self):
+        with self.lock:
+            return sorted((path.stem for path in self.directory.glob("*.jsonl")
+                           if re.fullmatch(r"\d{4}-\d{2}-\d{2}", path.stem)), reverse=True)
+
+    def read_day(self, day, limit=100, query=""):
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+            raise APIError(400, "date must use YYYY-MM-DD format")
+        if type(limit) is not int or not 1 <= limit <= 500:
+            raise APIError(400, "limit must be between 1 and 500")
+        query = query.strip().lower()[:200]
+        # Make queued records visible before an administrator reads the file.
+        self.queue.join()
+        path = self.directory / f"{day}.jsonl"
+        items = []
+        if not path.exists():
+            return {"date": day, "items": [], "days": self.list_days()}
+        with self.lock:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    try:
+                        item = json.loads(line)
+                    except (ValueError, TypeError):
+                        continue
+                    if query and query not in json.dumps(item, ensure_ascii=False).lower():
+                        continue
+                    items.append(item)
+                    if len(items) > limit:
+                        items.pop(0)
+        items.reverse()
+        return {"date": day, "items": items, "days": self.list_days()}
+
     def close(self):
         self.queue.join()
         self.queue.put(None)

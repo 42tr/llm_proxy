@@ -6,6 +6,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+from urllib.parse import urlencode
 
 import app
 
@@ -106,6 +107,16 @@ class ProxyTests(unittest.TestCase):
         req = Request(self.base + "/api/admin/model-routes", data=body, method="POST", headers={"Authorization": "Bearer admin", "Content-Type": "application/json"})
         self.assertEqual(urlopen(req).status, 201)
         self.assertEqual(self.request({"model": "second", "messages": [{"role": "user", "content": "hi"}]}).status, 200)
+
+    def test_admin_can_read_call_logs_by_date(self):
+        response = self.request({"model": "demo", "messages": [{"role": "user", "content": "hi"}]})
+        response.read()
+        self.app.logger.queue.join()
+        query = urlencode({"date": time.strftime("%Y-%m-%d"), "q": "demo", "limit": "10"})
+        req = Request(self.base + "/api/admin/logs?" + query, headers={"Authorization": "Bearer admin"})
+        result = json.loads(urlopen(req).read())
+        self.assertGreaterEqual(len(result["items"]), 1)
+        self.assertEqual(result["items"][0]["model"], "demo")
 
 
 if __name__ == "__main__":

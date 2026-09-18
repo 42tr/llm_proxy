@@ -8,6 +8,7 @@ const api = async (path, options={}) => {
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let providers = [], routes = [];
 $('#adminKey').addEventListener('change', load);
+$('#logDate').value = new Date().toISOString().slice(0, 10);
 function formObject(form) {
   const data = Object.fromEntries(new FormData(form));
   data.enabled = form.elements.enabled.checked;
@@ -29,13 +30,15 @@ function render(){
   $('#routes').innerHTML = routes.map(r => `<tr><td>${esc(r.public_model)}</td><td><code>${esc(r.upstream_model)}</code></td><td>${esc(r.provider_name)}</td><td>${r.enabled&&r.provider_enabled?'启用':'停用'}</td><td><button data-edit-route="${esc(r.id)}">编辑</button><button data-delete-route="${esc(r.id)}">删除</button></td></tr>`).join('');
 }
 async function load(){ try { providers=(await api('/api/admin/providers')).items; routes=(await api('/api/admin/model-routes')).items; render(); $('#pageError').textContent=''; } catch(e) { $('#pageError').textContent=e.message; } }
+async function loadLogs(){ const form=$('#logForm'); const params=new URLSearchParams(new FormData(form)); try { const result=await api('/api/admin/logs?'+params); $('#logs').innerHTML=result.items.map(item => `<tr><td>${esc(item.time)}</td><td>${esc(item.model)}</td><td>${esc(item.status)}</td><td>${esc(item.latency_ms)} ms</td><td>${item.stream?'是':'否'}</td><td>${esc(item.error||'')}</td><td><details><summary>查看</summary><pre>${esc(JSON.stringify(item,null,2))}</pre></details></td></tr>`).join(''); $('#logResult').textContent=`共 ${result.items.length} 条（${esc(result.date)}）`; } catch(e) { $('#logResult').className='error'; $('#logResult').textContent=' '+e.message; } }
 $('#providerForm').onsubmit = async e => { e.preventDefault(); const result=$('#providerResult'); try { const x=formObject(e.target); const id=x.id; delete x.id; if (!x.api_key) delete x.api_key; await api('/api/admin/providers'+(id?'/'+encodeURIComponent(id):''), {method:id?'PUT':'POST',body:JSON.stringify(x)}); result.className='ok'; result.textContent=' 已保存'; resetProvider(); await load(); } catch(err){ result.className='error'; result.textContent=' '+err.message; } };
 $('#routeForm').onsubmit = async e => { e.preventDefault(); const result=$('#routeResult'); try { const x=formObject(e.target); const id=x.id; delete x.id; delete x.log_request_body; delete x.log_response_body; delete x.extra_headers; delete x.timeout_ms; delete x.auth_type; delete x.api_key; await api('/api/admin/model-routes'+(id?'/'+encodeURIComponent(id):''), {method:id?'PUT':'POST',body:JSON.stringify(x)}); result.className='ok'; result.textContent=' 已保存'; resetRoute(); await load(); } catch(err){ result.className='error'; result.textContent=' '+err.message; } };
 $('#providerCancel').onclick=resetProvider; $('#routeCancel').onclick=resetRoute;
+$('#logForm').onsubmit = e => { e.preventDefault(); loadLogs(); };
 document.addEventListener('click', async e => { const t=e.target; try {
   if(t.dataset.editProvider){ const p=providers.find(x=>x.id===t.dataset.editProvider), f=$('#providerForm'); for(const k of ['id','name','endpoint_url','auth_type','auth_header_name','timeout_ms']) f.elements[k].value=p[k]??''; f.elements.api_key.value=''; f.elements.extra_headers.value=JSON.stringify(p.extra_headers||{},null,2); f.elements.enabled.checked=p.enabled; f.elements.log_request_body.checked=p.log_request_body; f.elements.log_response_body.checked=p.log_response_body; $('#providerCancel').hidden=false; }
   if(t.dataset.deleteProvider && confirm('删除该上游服务？')) { await api('/api/admin/providers/'+encodeURIComponent(t.dataset.deleteProvider),{method:'DELETE'}); await load(); }
   if(t.dataset.editRoute){ const r=routes.find(x=>x.id===t.dataset.editRoute), f=$('#routeForm'); for(const k of ['id','public_model','upstream_model','provider_id']) f.elements[k].value=r[k]??''; f.elements.enabled.checked=r.enabled; $('#routeCancel').hidden=false; }
   if(t.dataset.deleteRoute && confirm('删除该模型映射？')) { await api('/api/admin/model-routes/'+encodeURIComponent(t.dataset.deleteRoute),{method:'DELETE'}); await load(); }
  } catch(err){ $('#pageError').textContent=err.message; } });
-load();
+load(); loadLogs();

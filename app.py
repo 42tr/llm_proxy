@@ -15,7 +15,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from storage import APIError, CallLogger, Capture, ConfigStore, now, text_field, token_file, uid
 
@@ -249,6 +249,16 @@ class Handler(BaseHTTPRequestHandler):
     def admin(self, parts):
         if parts == ["access"] and self.command == "GET":
             self.respond(200, {"client_api_key": self.app.proxy_key})
+            return
+        if parts == ["logs"] and self.command == "GET":
+            query = parse_qs(urlsplit(self.path).query)
+            day = query.get("date", [now()[:10]])[0]
+            term = query.get("q", [""])[0]
+            try:
+                limit = int(query.get("limit", [100])[0])
+            except (TypeError, ValueError) as exc:
+                raise APIError(400, "limit must be an integer") from exc
+            self.respond(200, self.app.logger.read_day(day, limit, term))
             return
         if not parts or parts[0] not in ("providers", "model-routes") or len(parts) > 3:
             raise APIError(404, "not found", "not_found")
