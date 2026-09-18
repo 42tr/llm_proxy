@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>LLM Proxy 配置</title><link rel="stylesheet" href="/static/admin.css">
+</head>
+<body>
+<main>
+  <h1>LLM Proxy 配置</h1>
+  <p class="muted">客户端只传 <code>model</code>。配置保存到服务端 SQLite，API Key 不会回显。</p>
+  <label>管理 API Key <input id="adminKey" type="password" placeholder="服务设置了 LLM_PROXY_ADMIN_KEY 时填写"></label>
+
+  <section><h2>上游服务</h2>
+    <form id="providerForm">
+      <input name="id" type="hidden">
+      <div class="grid">
+        <label>服务名称<input name="name" required placeholder="OpenAI 生产"></label>
+        <label>完整接口地址<input name="endpoint_url" required placeholder="https://example.com/v1/chat/completions"></label>
+        <label>认证方式<select name="auth_type"><option value="bearer">Bearer</option><option value="api_key">api-key</option><option value="custom_header">自定义 Header</option><option value="none">无认证</option></select></label>
+        <label>API Key<input name="api_key" type="password" placeholder="编辑时留空表示保持原值"></label>
+        <label>自定义认证 Header 名<input name="auth_header_name" placeholder="仅 custom_header 使用"></label>
+        <label>超时（毫秒）<input name="timeout_ms" type="number" value="120000" min="100" max="3600000"></label>
+      </div>
+      <label>额外请求头（JSON）<textarea name="extra_headers" placeholder='{"api-version":"2024-06-01"}'></textarea></label>
+      <label class="check"><input name="enabled" type="checkbox" checked> 启用</label>
+      <label class="check"><input name="log_request_body" type="checkbox"> 记录请求正文</label>
+      <label class="check"><input name="log_response_body" type="checkbox"> 记录响应正文</label>
+      <button type="submit">保存上游服务</button> <button id="providerCancel" type="button" hidden>取消编辑</button> <span id="providerResult"></span>
+    </form>
+    <table><thead><tr><th>名称</th><th>地址</th><th>认证</th><th>状态</th><th>操作</th></tr></thead><tbody id="providers"></tbody></table>
+  </section>
+
+  <section><h2>模型映射</h2>
+    <form id="routeForm">
+      <input name="id" type="hidden">
+      <div class="grid">
+        <label>客户端模型名<input name="public_model" required placeholder="gpt-4o"></label>
+        <label>上游模型名<input name="upstream_model" required placeholder="gpt-4o"></label>
+        <label>上游服务<select name="provider_id" id="providerSelect" required></select></label>
+      </div>
+      <label class="check"><input name="enabled" type="checkbox" checked> 启用</label>
+      <button type="submit">保存模型映射</button> <button id="routeCancel" type="button" hidden>取消编辑</button> <span id="routeResult"></span>
+    </form>
+    <table><thead><tr><th>客户端模型</th><th>上游模型</th><th>上游服务</th><th>状态</th><th>操作</th></tr></thead><tbody id="routes"></tbody></table>
+  </section>
+  <p id="pageError" class="error"></p>
+</main>
+<script src="/static/admin.js" defer></script>
+</body>
+</html>
