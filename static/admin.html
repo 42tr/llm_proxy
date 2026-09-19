@@ -1,37 +1,151 @@
 <!doctype html>
 <html lang="zh-CN">
 <head>
-  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>LLM Proxy 配置</title><link rel="stylesheet" href="/static/admin.css">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>LLM Proxy 配置</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <link rel="stylesheet" href="/static/admin.css">
 </head>
 <body>
-<main>
-  <h1>LLM Proxy 配置</h1>
-  <p class="muted">客户端只传 <code>model</code>。配置保存到服务端 SQLite，API Key 不会回显。</p>
-  <label>管理 API Key <input id="adminKey" type="password" placeholder="服务设置了 LLM_PROXY_ADMIN_KEY 时填写"></label>
+<div id="login" hidden>
+  <form id="loginForm" class="card login-card">
+    <div class="brand"><span class="logo" aria-hidden="true">LP</span><h1>LLM Proxy 管理登录</h1></div>
+    <p class="muted">输入管理 API Key 后可配置上游服务、模型映射并查看调用日志。验证通过即保存在本浏览器，下次进入无需重复输入；Key 输错或已失效时会重新要求输入。</p>
+    <label>管理 API Key
+      <input id="adminKey" type="password" autocomplete="off" spellcheck="false" placeholder="服务端 data/admin.token 或 LLM_PROXY_ADMIN_KEY">
+    </label>
+    <button id="loginSubmit" type="submit" class="primary">登录</button>
+    <p id="loginStatus" class="muted"></p>
+    <p id="loginError" class="error" role="alert"></p>
+  </form>
+</div>
+<main id="app" hidden>
+  <header class="bar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">LP</span>
+      <div>
+        <h1>LLM Proxy 配置</h1>
+        <p class="muted">客户端只传 <code>model</code>，配置保存在服务端 SQLite，上游 API Key 不会回显。</p>
+      </div>
+    </div>
+    <button id="logout" type="button" class="ghost" title="清除本浏览器保存的管理 API Key">退出登录</button>
+  </header>
 
-  <section><h2>上游服务</h2>
-    <form id="providerForm">
+  <nav class="tabs" aria-label="配置分区">
+    <a href="#providers">上游服务 <span class="badge" id="providerCount">0</span></a>
+    <a href="#routes">模型映射 <span class="badge" id="routeCount">0</span></a>
+    <a href="#logs">调用日志</a>
+  </nav>
+
+  <section class="card" id="providers">
+    <div class="section-head">
+      <div>
+        <h2>上游服务</h2>
+        <p class="hint muted">填写完整的 <code>chat/completions</code> 地址与认证信息；保存后立即生效，无需重启。</p>
+      </div>
+      <div class="section-actions">
+        <span id="providerFlash" class="flash" role="status"></span>
+        <button id="providerAdd" type="button" class="primary">新增上游服务</button>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>名称</th><th>地址</th><th>认证</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody id="providersBody"></tbody>
+      </table>
+    </div>
+    <div id="testPanel" class="panel" hidden>
+      <header><h3>上游连通性测试</h3><button id="testClose" type="button" class="ghost small">关闭</button></header>
+      <p id="testStatus" class="muted hint"></p>
+      <pre id="testResult"></pre>
+    </div>
+  </section>
+
+  <section class="card" id="routes">
+    <div class="section-head">
+      <div>
+        <h2>模型映射</h2>
+        <p class="hint muted">把客户端模型名映射到上游服务和上游模型名。</p>
+      </div>
+      <div class="section-actions">
+        <span id="routeFlash" class="flash" role="status"></span>
+        <button id="routeAdd" type="button" class="primary">新增模型映射</button>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>客户端模型</th><th>上游模型</th><th>上游服务</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody id="routesBody"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card" id="logs">
+    <h2>调用日志</h2>
+    <p class="hint muted">按天保存在服务端 <code>data/logs</code>，可按 request_id、模型或错误信息检索。</p>
+    <form id="logForm">
+      <div class="grid">
+        <label>日期<input name="date" id="logDate" type="date"></label>
+        <label>关键字<input name="q" placeholder="request_id、model 或错误信息"></label>
+        <label>最多显示条数<input name="limit" type="number" value="100" min="1" max="500"></label>
+      </div>
+      <div class="actions">
+        <button type="submit" class="primary">查询日志</button>
+        <span id="logResult" class="muted" role="status"></span>
+      </div>
+    </form>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>时间</th><th>模型</th><th>状态</th><th>耗时</th><th>流式</th><th>错误</th><th>详情</th></tr></thead>
+        <tbody id="logsBody"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <dialog id="providerDialog" class="modal">
+    <div class="modal-head">
+      <h3 id="providerDialogTitle">新增上游服务</h3>
+      <button type="button" class="ghost small" data-close>关闭</button>
+    </div>
+    <form id="providerForm" class="modal-body">
       <input name="id" type="hidden">
       <div class="grid">
         <label>服务名称<input name="name" required placeholder="OpenAI 生产"></label>
         <label>完整接口地址<input name="endpoint_url" required placeholder="https://example.com/v1/chat/completions"></label>
-        <label>认证方式<select name="auth_type"><option value="bearer">Bearer</option><option value="api_key">api-key</option><option value="custom_header">自定义 Header</option><option value="none">无认证</option></select></label>
-        <label>API Key<input name="api_key" type="password" placeholder="编辑时留空表示保持原值"></label>
+        <label>认证方式
+          <select name="auth_type">
+            <option value="bearer">Bearer</option>
+            <option value="api_key">api-key</option>
+            <option value="custom_header">自定义 Header</option>
+            <option value="none">无认证</option>
+          </select>
+        </label>
+        <label>API Key<input name="api_key" type="password" autocomplete="off" placeholder="编辑时留空表示保持原值"></label>
         <label>自定义认证 Header 名<input name="auth_header_name" placeholder="仅 custom_header 使用"></label>
-        <label>超时（毫秒）<input name="timeout_ms" type="number" value="120000" min="100" max="3600000"></label>
+        <label>超时（毫秒）<input name="timeout_ms" type="number" value="120000" min="100" max="3600000" step="100"></label>
       </div>
       <label>额外请求头（JSON）<textarea name="extra_headers" placeholder='{"api-version":"2024-06-01"}'></textarea></label>
-      <label class="check"><input name="enabled" type="checkbox" checked> 启用</label>
-      <label class="check"><input name="log_request_body" type="checkbox"> 记录请求正文</label>
-      <label class="check"><input name="log_response_body" type="checkbox"> 记录响应正文</label>
-      <button type="submit">保存上游服务</button> <button id="providerCancel" type="button" hidden>取消编辑</button> <span id="providerResult"></span>
+      <div class="checks">
+        <label class="check"><input name="enabled" type="checkbox" checked> 启用</label>
+        <label class="check"><input name="log_request_body" type="checkbox"> 记录请求正文</label>
+        <label class="check"><input name="log_response_body" type="checkbox"> 记录响应正文</label>
+      </div>
+      <div class="actions">
+        <button type="submit" class="primary">保存</button>
+        <button type="button" class="ghost" data-close>取消</button>
+        <span id="providerResult" role="status"></span>
+      </div>
     </form>
-    <table><thead><tr><th>名称</th><th>地址</th><th>认证</th><th>状态</th><th>操作</th></tr></thead><tbody id="providers"></tbody></table>
-  </section>
+  </dialog>
 
-  <section><h2>模型映射</h2>
-    <form id="routeForm">
+  <dialog id="routeDialog" class="modal">
+    <div class="modal-head">
+      <h3 id="routeDialogTitle">新增模型映射</h3>
+      <button type="button" class="ghost small" data-close>关闭</button>
+    </div>
+    <form id="routeForm" class="modal-body">
       <input name="id" type="hidden">
       <div class="grid">
         <label>客户端模型名<input name="public_model" required placeholder="gpt-4o"></label>
@@ -39,22 +153,36 @@
         <label>上游服务<select name="provider_id" id="providerSelect" required></select></label>
       </div>
       <label class="check"><input name="enabled" type="checkbox" checked> 启用</label>
-      <button type="submit">保存模型映射</button> <button id="routeCancel" type="button" hidden>取消编辑</button> <span id="routeResult"></span>
-    </form>
-    <table><thead><tr><th>客户端模型</th><th>上游模型</th><th>上游服务</th><th>状态</th><th>操作</th></tr></thead><tbody id="routes"></tbody></table>
-  </section>
-  <section><h2>调用日志</h2>
-    <form id="logForm">
-      <div class="grid">
-        <label>日期<input name="date" id="logDate" type="date"></label>
-        <label>关键字<input name="q" placeholder="request_id、model 或错误信息"></label>
-        <label>最多显示条数<input name="limit" type="number" value="100" min="1" max="500"></label>
+      <div class="actions">
+        <button type="submit" class="primary">保存</button>
+        <button type="button" class="ghost" data-close>取消</button>
+        <span id="routeResult" role="status"></span>
       </div>
-      <button type="submit">查询日志</button> <span id="logResult" class="muted"></span>
     </form>
-    <table><thead><tr><th>时间</th><th>模型</th><th>状态</th><th>耗时</th><th>流式</th><th>错误</th><th>详情</th></tr></thead><tbody id="logs"></tbody></table>
-  </section>
-  <p id="pageError" class="error"></p>
+  </dialog>
+
+  <dialog id="logDialog" class="modal wide">
+    <div class="modal-head">
+      <h3 id="logDialogTitle">调用详情</h3>
+      <button type="button" class="ghost small" data-close>关闭</button>
+    </div>
+    <div class="modal-body">
+      <dl class="meta" id="logMeta"></dl>
+      <section class="capture">
+        <header><h4>入参 · 客户端请求正文</h4><span id="logReqNote" class="muted hint"></span></header>
+        <pre id="logReqBody"></pre>
+      </section>
+      <section class="capture">
+        <header><h4>出参 · 上游响应正文</h4><span id="logResNote" class="muted hint"></span></header>
+        <pre id="logResBody"></pre>
+      </section>
+      <details class="raw">
+        <summary>完整日志 JSON</summary>
+        <pre id="logRaw"></pre>
+      </details>
+    </div>
+  </dialog>
+  <p id="pageError" class="error" role="alert"></p>
 </main>
 <script src="/static/admin.js" defer></script>
 </body>

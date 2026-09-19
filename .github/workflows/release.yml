@@ -18,15 +18,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          python-version: '3.12'
+          components: rustfmt, clippy
 
-      - name: Run integration tests
-        run: |
-          python -m pip install -r requirements.txt
-          python -m unittest discover -s tests -v
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --all-targets --verbose
 
       - name: Compute image version
         id: meta
