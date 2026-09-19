@@ -91,11 +91,17 @@ docker exec llm-proxy cat /data/admin.token
 
 可通过 `-e LLM_PROXY_ADMIN_KEY`、`-e LLM_PROXY_API_KEY`、`-e LLM_PROXY_MASTER_KEY` 注入环境中已有的密钥。镜像默认监听 `0.0.0.0:8080`，支持 `LLM_PROXY_HOST`、`LLM_PROXY_PORT`、`LLM_PROXY_DATA_DIR` 环境变量，命令行参数优先。
 
+镜像本身只负责打包：CI 先在 runner 上原生交叉编译出两种架构的二进制，buildx 再按 `TARGETARCH` 把对应二进制装进镜像，构建过程不再经历 QEMU 模拟编译 Rust。本地构建镜像时先编译再把二进制放到对应 `dist/` 目录：
+
+```bash
+cargo build --release
+mkdir -p dist/amd64 && cp target/release/llm-proxy dist/amd64/
+docker build -t llm-proxy:local .
+```
+
 ## 发布
 
-`.github/workflows/release.yml` 在推送 tag 时先用 Rust 工具链执行 `cargo fmt --all --check`、`cargo clippy --all-targets -- -D warnings` 和 `cargo test`，再通过 QEMU/Buildx 构建并推送多架构镜像。GHCR 使用工作流的 `GITHUB_TOKEN`；阿里云使用仓库 Secrets `ALIYUN_REGISTRY_USERNAME` 和 `ALIYUN_REGISTRY_PASSWORD`。沿用 `diting` 设置，关闭 provenance 以兼容阿里云 ACR 个人版。
-
-改用 Rust 之后，`linux/arm64` 镜像需要在 QEMU 模拟下原生编译整棵依赖树（含 bundled SQLite），构建时间比原来的 Python 打包长很多；工作流里的 `Swatinem/rust-cache` 只加速宿主机架构上的 `clippy`/`test` 步骤，跨架构构建缓存不共享。如需缩短发布时间，可以改用交叉编译目标或原生 arm64 runner。
+`.github/workflows/release.yml` 在推送 tag 时先用 Rust 工具链执行 `cargo fmt --all --check`、`cargo clippy --all-targets -- -D warnings` 和 `cargo test`，然后在 runner 上用 `gcc-aarch64-linux-gnu` 原生交叉编译出 `x86_64` 与 `aarch64` 的 release 二进制，最后由 buildx 按架构打包并推送多架构镜像；QEMU 只承担镜像里 `useradd` 这一步的模拟。编译产物通过 `Swatinem/rust-cache` 在 tag 推送时也会保存（`save-if: true`），连续发布可以复用依赖构建结果。GHCR 使用工作流的 `GITHUB_TOKEN`；阿里云使用仓库 Secrets `ALIYUN_REGISTRY_USERNAME` 和 `ALIYUN_REGISTRY_PASSWORD`。沿用 `diting` 设置，关闭 provenance 以兼容阿里云 ACR 个人版。
 
 ```bash
 git push origin main

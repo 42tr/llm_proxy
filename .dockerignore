@@ -5,6 +5,10 @@ Dockerfile
 README.md
 target
 tests
+src
+static
+Cargo.toml
+Cargo.lock
 data
 logs
 *.sqlite3*

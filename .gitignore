@@ -1,4 +1,5 @@
 /target
+dist/
 data/
 *.sqlite3*
 *.db*
