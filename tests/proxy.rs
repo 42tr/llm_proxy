@@ -768,6 +768,14 @@ fn concurrency_limit_is_enforced_and_released() {
             .status,
         200
     );
+    // The server writes the response before finishing the handler and releasing
+    // the permit. Give that worker a chance to finish before checking the count.
+    for _ in 0..100 {
+        if harness.app.calls.in_use() == 0 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
     assert_eq!(
         harness.app.calls.in_use(),
         0,

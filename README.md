@@ -101,7 +101,7 @@ docker build -t llm-proxy:local .
 
 ## 发布
 
-`.github/workflows/release.yml` 在推送 tag 时先用 Rust 工具链执行 `cargo fmt --all --check`、`cargo clippy --all-targets -- -D warnings` 和 `cargo test`，然后在 runner 上用 `gcc-aarch64-linux-gnu` 原生交叉编译出 `x86_64` 与 `aarch64` 的 release 二进制，最后由 buildx 按架构打包并推送多架构镜像；QEMU 只承担镜像里 `useradd` 这一步的模拟。编译产物通过 `Swatinem/rust-cache` 在 tag 推送时也会保存（`save-if: true`），连续发布可以复用依赖构建结果。GHCR 使用工作流的 `GITHUB_TOKEN`；阿里云使用仓库 Secrets `ALIYUN_REGISTRY_USERNAME` 和 `ALIYUN_REGISTRY_PASSWORD`。沿用 `diting` 设置，关闭 provenance 以兼容阿里云 ACR 个人版。
+`.github/workflows/release.yml` 在推送 tag 时先用 Rust 工具链执行 `cargo fmt --all --check`、`cargo clippy --all-targets -- -D warnings` 和 `cargo test`，然后在 runner 上用 `gcc-aarch64-linux-gnu` 原生交叉编译出 `x86_64` 与 `aarch64` 的 release 二进制，最后由 buildx 按架构打包并推送多架构镜像；Dockerfile 不执行目标架构命令，因此整个镜像打包过程无需 QEMU。编译产物通过 `Swatinem/rust-cache` 在 tag 推送时也会保存（`save-if: true`），连续发布可以复用依赖构建结果。GHCR 使用工作流的 `GITHUB_TOKEN`；阿里云使用仓库 Secrets `ALIYUN_REGISTRY_USERNAME` 和 `ALIYUN_REGISTRY_PASSWORD`。沿用 `diting` 设置，关闭 provenance 以兼容阿里云 ACR 个人版。
 
 ```bash
 git push origin main

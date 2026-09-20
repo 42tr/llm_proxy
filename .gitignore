@@ -1,6 +1,8 @@
 /target
 dist/
 data/
+!docker/data/
+!docker/data/.gitkeep
 *.sqlite3*
 *.db*
 *.token
