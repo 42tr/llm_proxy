@@ -18,6 +18,9 @@ jobs:
       CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
       CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
       AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc-ar
+      # C dependencies such as ring must use the target libc headers instead
+      # of falling back to the runner's native /usr/include directory.
+      CFLAGS_aarch64_unknown_linux_gnu: --sysroot=/usr/aarch64-linux-gnu
       # Explicit --target builds make cc-rs look for triple-prefixed tools;
       # pin them so the build does not depend on what the runner image ships.
       CC_x86_64_unknown_linux_gnu: gcc
@@ -51,7 +54,10 @@ jobs:
       - name: Install the aarch64 cross toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu \
+            libc6-dev-arm64-cross
+          test -f /usr/aarch64-linux-gnu/include/bits/libc-header-start.h
 
       - name: Cross-compile release binaries for both architectures
         run: |
