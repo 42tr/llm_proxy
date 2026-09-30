@@ -507,6 +507,7 @@ dependencies = [
  "getrandom",
  "hmac",
  "libc",
+ "memchr",
  "rusqlite",
  "serde",
  "serde_json",

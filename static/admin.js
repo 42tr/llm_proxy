@@ -5,11 +5,16 @@ class AuthError extends Error {}
 let adminKey = '';
 const readStoredKey = () => { try { return localStorage.getItem(KEY_STORAGE) || ''; } catch { return ''; } };
 const writeStoredKey = value => { try { value ? localStorage.setItem(KEY_STORAGE, value) : localStorage.removeItem(KEY_STORAGE); } catch {} };
-const api = async (path, options={}) => {
+// Raw authorized fetch; any 401 re-locks the console.
+const request = async (path, options={}) => {
   options.headers = {'Content-Type':'application/json', ...(options.headers||{})};
   if (adminKey) options.headers.Authorization = 'Bearer ' + adminKey;
-  const res = await fetch(path, options); const value = await res.json().catch(() => ({}));
+  const res = await fetch(path, options);
   if (res.status === 401) { lock('管理 API Key 无效或已失效，请重新输入'); throw new AuthError('管理 API Key 无效或已失效'); }
+  return res;
+};
+const api = async (path, options={}) => {
+  const res = await request(path, options); const value = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(value.error?.message || res.statusText); return value;
 };
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -61,10 +66,11 @@ function render(){
   $('#providerCount').textContent = providers.length;
   $('#routeCount').textContent = routes.length;
 }
-async function load(){ try { providers=(await api('/api/admin/providers')).items; routes=(await api('/api/admin/model-routes')).items; render(); $('#pageError').textContent=''; } catch(e) { $('#pageError').textContent=e.message; } }
+async function load(){ try { const [p, r] = await Promise.all([api('/api/admin/providers'), api('/api/admin/model-routes')]); providers=p.items; routes=r.items; render(); $('#pageError').textContent=''; } catch(e) { $('#pageError').textContent=e.message; } }
 const statusPill = status => `<span class="pill ${Number(status) < 400 ? 'on' : 'bad'}">${esc(status)}</span>`;
-let logItems = [];
-async function loadLogs(){ const form=$('#logForm'); const params=new URLSearchParams(new FormData(form)); try { const result=await api('/api/admin/logs?'+params); logItems=result.items; $('#logsBody').innerHTML=result.items.map((item,i) => `<tr><td class="mono">${esc(item.time)}</td><td>${esc(item.model)}</td><td>${statusPill(item.status)}</td><td>${esc(item.latency_ms)} ms</td><td>${item.stream?'是':'否'}</td><td>${item.error?`<span class="pill bad">${esc(item.error)}</span>`:''}</td><td><button class="small" data-log="${i}">查看</button></td></tr>`).join(''); $('#logResult').className='muted'; $('#logResult').textContent=`共 ${result.items.length} 条（${esc(result.date)}）`; } catch(e) { $('#logResult').className='error'; $('#logResult').textContent=' '+e.message; } }
+// Listings carry no bodies; 查看 fetches the full record for the listed day.
+let logItems = [], logDate = '';
+async function loadLogs(){ const form=$('#logForm'); const params=new URLSearchParams(new FormData(form)); try { const result=await api('/api/admin/logs?'+params); logItems=result.items; logDate=result.date; $('#logsBody').innerHTML=result.items.map((item,i) => `<tr><td class="mono">${esc(item.time)}</td><td>${esc(item.model)}</td><td>${statusPill(item.status)}</td><td>${esc(item.latency_ms)} ms</td><td>${item.stream?'是':'否'}</td><td>${item.error?`<span class="pill bad">${esc(item.error)}</span>`:''}</td><td><button class="small" data-log="${i}">查看</button></td></tr>`).join(''); $('#logResult').className='muted'; $('#logResult').textContent=`共 ${result.items.length} 条（${esc(result.date)}）`; } catch(e) { $('#logResult').className='error'; $('#logResult').textContent=' '+e.message; } }
 $('#providerForm').onsubmit = async e => { e.preventDefault(); const result=$('#providerResult'); try { const x=formObject(e.target); const id=x.id; delete x.id; if (!x.api_key) delete x.api_key; await api('/api/admin/providers'+(id?'/'+encodeURIComponent(id):''), {method:id?'PUT':'POST',body:JSON.stringify(x)}); $('#providerDialog').close(); flash('#providerFlash', id?'上游服务已更新':'上游服务已新增'); await load(); } catch(err){ result.className='error'; result.textContent=' '+err.message; } };
 $('#routeForm').onsubmit = async e => { e.preventDefault(); const result=$('#routeResult'); try { const x=formObject(e.target); const id=x.id; delete x.id; delete x.log_request_body; delete x.log_response_body; delete x.extra_headers; delete x.timeout_ms; delete x.auth_type; delete x.api_key; await api('/api/admin/model-routes'+(id?'/'+encodeURIComponent(id):''), {method:id?'PUT':'POST',body:JSON.stringify(x)}); $('#routeDialog').close(); flash('#routeFlash', id?'模型映射已更新':'模型映射已新增'); await load(); } catch(err){ result.className='error'; result.textContent=' '+err.message; } };
 $('#providerAdd').onclick = () => openProviderDialog();
@@ -80,15 +86,14 @@ async function runProviderTest(providerId){
   const panel=$('#testPanel'), status=$('#testStatus'), result=$('#testResult');
   panel.hidden = false; status.className='muted hint'; status.textContent=`正在用 ${model.trim()} 调用上游…`; result.textContent='';
   try {
-    const res = await fetch('/api/admin/providers/'+encodeURIComponent(providerId)+'/test', {method:'POST', headers:{'Content-Type':'application/json', ...(adminKey?{Authorization:'Bearer '+adminKey}:{})}, body:JSON.stringify({model:model.trim()})});
-    if (res.status === 401) { lock('管理 API Key 无效或已失效，请重新输入'); return; }
+    const res = await request('/api/admin/providers/'+encodeURIComponent(providerId)+'/test', {method:'POST', body:JSON.stringify({model:model.trim()})});
     const text = await res.text();
     let pretty = text;
     try { pretty = JSON.stringify(JSON.parse(text), null, 2); } catch {}
     status.className = res.ok ? 'ok hint' : 'error hint';
     status.textContent = `上游返回 ${res.status}${res.ok ? '，连通正常' : '，请检查地址、认证与模型名'}`;
     result.textContent = pretty || '(空响应)';
-  } catch(err){ status.className='error hint'; status.textContent=' 请求失败：'+err.message; result.textContent=''; }
+  } catch(err){ if (err instanceof AuthError) return; status.className='error hint'; status.textContent=' 请求失败：'+err.message; result.textContent=''; }
 }
 $('#logForm').onsubmit = e => { e.preventDefault(); loadLogs(); };
 document.addEventListener('click', async e => { const t=e.target; try {
@@ -97,14 +102,16 @@ document.addEventListener('click', async e => { const t=e.target; try {
   if(t.dataset.editRoute){ openRouteDialog(routes.find(x=>x.id===t.dataset.editRoute)); }
   if(t.dataset.deleteRoute && confirm('删除该模型映射？')) { await api('/api/admin/model-routes/'+encodeURIComponent(t.dataset.deleteRoute),{method:'DELETE'}); await load(); }
   if(t.dataset.testProvider) await runProviderTest(t.dataset.testProvider);
-  if(t.dataset.log !== undefined) openLogDialog(logItems[Number(t.dataset.log)]);
+  if(t.dataset.log !== undefined) await openLogDialog(logItems[Number(t.dataset.log)]);
  } catch(err){ $('#pageError').textContent=err.message; } });
-const decodeCapture = cap => { if(!cap) return null; if(cap.encoding === 'base64'){ try { return atob(cap.body); } catch { return '(base64 解码失败)'; } } return cap.body; };
+// Base64 bodies are raw bytes: decode them as UTF-8 so non-ASCII text stays readable.
+const decodeCapture = cap => { if(!cap) return null; if(cap.encoding === 'base64'){ try { return new TextDecoder().decode(Uint8Array.from(atob(cap.body), c => c.charCodeAt(0))); } catch { return '(base64 解码失败)'; } } return cap.body; };
 const prettyMaybe = text => { try { return JSON.stringify(JSON.parse(text), null, 2); } catch { return text; } };
 const metaCell = (label, value) => (value === undefined || value === null || value === '') ? '' : `<div><dt>${esc(label)}</dt><dd>${esc(value)}</dd></div>`;
 // Show the captured request/response bodies instead of one raw JSON blob.
-function openLogDialog(item){
-  if(!item) return;
+async function openLogDialog(summary){
+  if(!summary) return;
+  const item = await api('/api/admin/logs/'+encodeURIComponent(summary.request_id)+'?date='+encodeURIComponent(logDate));
   $('#logDialogTitle').textContent = `调用详情 · ${item.model || item.request_id}`;
   $('#logMeta').innerHTML = [
     metaCell('请求 ID', item.request_id), metaCell('时间', item.time), metaCell('来源', item.source),

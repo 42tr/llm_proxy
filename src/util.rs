@@ -85,6 +85,20 @@ pub fn token_file(path: &Path) -> io::Result<String> {
     Ok(String::from_utf8_lossy(&bytes).trim().to_string())
 }
 
+/// Cut `data` to at most `limit` bytes without splitting a UTF-8 sequence at the end.
+///
+/// Data that is not UTF-8 anyway is cut at exactly `limit` bytes.
+pub fn truncate_utf8(data: &[u8], limit: usize) -> &[u8] {
+    if data.len() <= limit {
+        return data;
+    }
+    let prefix = &data[..limit];
+    match std::str::from_utf8(prefix) {
+        Err(err) if err.error_len().is_none() => &prefix[..err.valid_up_to()],
+        _ => prefix,
+    }
+}
+
 pub fn trim_ascii(bytes: &[u8]) -> Vec<u8> {
     let start = bytes
         .iter()
@@ -95,4 +109,20 @@ pub fn trim_ascii(bytes: &[u8]) -> Vec<u8> {
         .rposition(|b| !b.is_ascii_whitespace())
         .map_or(start, |i| i + 1);
     bytes[start..end].to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_utf8;
+
+    #[test]
+    fn truncation_keeps_utf8_sequences_whole() {
+        let text = "ab中文".as_bytes();
+        assert_eq!(truncate_utf8(text, 10), text);
+        assert_eq!(truncate_utf8(text, 5), b"ab\xe4\xb8\xad");
+        assert_eq!(truncate_utf8(text, 4), b"ab");
+        assert_eq!(truncate_utf8(text, 3), b"ab");
+        assert_eq!(truncate_utf8(text, 2), b"ab");
+        assert_eq!(truncate_utf8(b"\xff\xfe\xfd", 2), b"\xff\xfe");
+    }
 }

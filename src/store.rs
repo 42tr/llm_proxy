@@ -1,8 +1,8 @@
 //! SQLite backed configuration; upstream credentials are stored Fernet encrypted.
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension, Row, ToSql};
@@ -48,13 +48,58 @@ const BLOCKED_HEADERS: [&str; 14] = [
     "accept-encoding",
 ];
 
+/// Header names whose values are treated as credentials.
+const SECRET_HEADER_WORDS: [&str; 7] = [
+    "authorization",
+    "api-key",
+    "api_key",
+    "apikey",
+    "token",
+    "secret",
+    "password",
+];
+
+const ROUTE_SELECT: &str = "SELECT r.*, p.name provider_name, p.enabled provider_enabled
+     FROM model_routes r JOIN providers p ON r.provider_id=p.id";
+
+/// How the upstream credential is sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthType {
+    None,
+    Bearer,
+    ApiKey,
+    CustomHeader,
+}
+
+impl AuthType {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "none" => Some(Self::None),
+            "bearer" => Some(Self::Bearer),
+            "api_key" => Some(Self::ApiKey),
+            "custom_header" => Some(Self::CustomHeader),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Bearer => "bearer",
+            Self::ApiKey => "api_key",
+            Self::CustomHeader => "custom_header",
+        }
+    }
+}
+
 /// A configured upstream. `api_key` is internal only and never serialized.
 #[derive(Debug, Clone, Serialize)]
 pub struct Provider {
     pub id: String,
     pub name: String,
     pub endpoint_url: String,
-    pub auth_type: String,
+    pub auth_type: AuthType,
     pub auth_header_name: String,
     pub timeout_ms: i64,
     pub enabled: bool,
@@ -109,7 +154,8 @@ impl ResolvedRoute {
     }
 }
 
-struct RawProvider {
+/// A `providers` row as stored: credentials and headers are still encrypted.
+struct ProviderRow {
     id: String,
     name: String,
     endpoint_url: String,
@@ -125,7 +171,7 @@ struct RawProvider {
     updated_at: String,
 }
 
-impl RawProvider {
+impl ProviderRow {
     fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
             id: row.get("id")?,
@@ -146,14 +192,10 @@ impl RawProvider {
 
     fn decrypt(self, cipher: &Fernet, secret: bool) -> Result<Provider> {
         let api_key = cipher.decrypt_text(&self.secret)?;
-        let stored: Headers = serde_json::from_slice(&cipher.decrypt(&self.headers)?)
-            .ok()
-            .filter(|value: &Value| value.is_object())
-            .and_then(|value| match value {
-                Value::Object(map) => Some(map),
-                _ => None,
-            })
-            .unwrap_or_default();
+        let stored: Headers = match serde_json::from_slice(&cipher.decrypt(&self.headers)?) {
+            Ok(Value::Object(map)) => map,
+            _ => Headers::new(),
+        };
         let extra_headers = if secret {
             stored
         } else {
@@ -165,6 +207,8 @@ impl RawProvider {
                 })
                 .collect()
         };
+        let auth_type = AuthType::parse(&self.auth_type)
+            .ok_or_else(|| ApiError::internal("stored provider has an unknown auth_type"))?;
         Ok(Provider {
             has_api_key: !api_key.is_empty(),
             extra_headers,
@@ -172,7 +216,7 @@ impl RawProvider {
             id: self.id,
             name: self.name,
             endpoint_url: self.endpoint_url,
-            auth_type: self.auth_type,
+            auth_type,
             auth_header_name: self.auth_header_name,
             timeout_ms: self.timeout_ms,
             enabled: self.enabled,
@@ -182,11 +226,45 @@ impl RawProvider {
             updated_at: self.updated_at,
         })
     }
+
+    /// Insert or update; both statements bind the columns in the same order.
+    fn write(&self, conn: &Connection, update: bool) -> rusqlite::Result<usize> {
+        let sql = if update {
+            "UPDATE providers SET name=?2, endpoint_url=?3, auth_type=?4, auth_header_name=?5, secret=?6,
+             headers=?7, timeout_ms=?8, enabled=?9, log_request_body=?10, log_response_body=?11,
+             created_at=?12, updated_at=?13 WHERE id=?1"
+        } else {
+            "INSERT INTO providers (id, name, endpoint_url, auth_type, auth_header_name, secret, headers,
+             timeout_ms, enabled, log_request_body, log_response_body, created_at, updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)"
+        };
+        conn.execute(
+            sql,
+            params![
+                self.id,
+                self.name,
+                self.endpoint_url,
+                self.auth_type,
+                self.auth_header_name,
+                self.secret,
+                self.headers,
+                self.timeout_ms,
+                self.enabled,
+                self.log_request_body,
+                self.log_response_body,
+                self.created_at,
+                self.updated_at
+            ],
+        )
+    }
 }
 
+/// Configuration store. Resolved routes are cached in memory; every write clears the cache
+/// while still holding the connection lock, so a concurrent lookup never re-caches stale data.
 pub struct ConfigStore {
     conn: Mutex<Connection>,
     cipher: Fernet,
+    resolved: Mutex<HashMap<String, Arc<ResolvedRoute>>>,
 }
 
 impl ConfigStore {
@@ -217,6 +295,7 @@ impl ConfigStore {
         Ok(Self {
             conn: Mutex::new(conn),
             cipher,
+            resolved: Mutex::new(HashMap::new()),
         })
     }
 
@@ -224,6 +303,19 @@ impl ConfigStore {
         self.conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn cache(&self) -> MutexGuard<'_, HashMap<String, Arc<ResolvedRoute>>> {
+        self.resolved
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Commit a write and drop cached routes; the caller holds the connection lock.
+    fn commit(&self, transaction: rusqlite::Transaction<'_>) -> Result<()> {
+        transaction.commit()?;
+        self.cache().clear();
+        Ok(())
     }
 
     fn all_secrets(conn: &Connection) -> Result<Vec<String>> {
@@ -234,10 +326,10 @@ impl ConfigStore {
         Ok(tokens)
     }
 
-    fn query(conn: &Connection, sql: &str, args: &[&dyn ToSql]) -> Result<Vec<RawProvider>> {
+    fn query(conn: &Connection, sql: &str, args: &[&dyn ToSql]) -> Result<Vec<ProviderRow>> {
         let mut statement = conn.prepare(sql)?;
         let rows = statement
-            .query_map(args, RawProvider::from_row)?
+            .query_map(args, ProviderRow::from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -281,17 +373,12 @@ impl ConfigStore {
         let name = text_field(data, "name")?;
         let endpoint_url = endpoint(data.get("endpoint_url"))?;
         let auth_type = match data.get("auth_type") {
-            None => "bearer".to_string(),
-            Some(Value::String(value)) => value.clone(),
-            Some(_) => String::new(),
-        };
-        if !matches!(
-            auth_type.as_str(),
-            "none" | "bearer" | "api_key" | "custom_header"
-        ) {
-            return Err(ApiError::bad("invalid auth_type"));
+            None => Some(AuthType::Bearer),
+            Some(Value::String(value)) => AuthType::parse(value),
+            Some(_) => None,
         }
-        let auth_header_name = if auth_type == "custom_header" {
+        .ok_or_else(|| ApiError::bad("invalid auth_type"))?;
+        let auth_header_name = if auth_type == AuthType::CustomHeader {
             header_name(data.get("auth_header_name"), true)?
         } else {
             String::new()
@@ -303,7 +390,7 @@ impl ConfigStore {
                 .map(|provider| provider.api_key.clone())
                 .unwrap_or_default(),
         };
-        if auth_type == "none" {
+        if auth_type == AuthType::None {
             api_key.clear();
         } else if api_key.is_empty() {
             return Err(ApiError::bad("api_key is required"));
@@ -364,7 +451,7 @@ impl ConfigStore {
             id,
             name,
             endpoint_url,
-            auth_type,
+            auth_type: auth_type.as_str().to_string(),
             auth_header_name,
             secret: self.cipher.encrypt(api_key.as_bytes()),
             headers: self
@@ -377,15 +464,9 @@ impl ConfigStore {
             created_at,
             updated_at: now(),
         };
-        let update = old.is_some();
         let transaction = conn.transaction()?;
-        let written = if update {
-            row.update(&transaction)
-        } else {
-            row.insert(&transaction)
-        };
-        match written {
-            Ok(_) => transaction.commit()?,
+        match row.write(&transaction, old.is_some()) {
+            Ok(_) => self.commit(transaction)?,
             Err(err) if is_constraint(&err) => {
                 return Err(ApiError::conflict("provider id is already in use"))
             }
@@ -394,13 +475,10 @@ impl ConfigStore {
         Self::provider_with(&conn, &self.cipher, &row.id, false)
     }
 
-    fn routes_with(conn: &Connection) -> Result<Vec<Route>> {
-        let mut statement = conn.prepare(
-            "SELECT r.*, p.name provider_name, p.enabled provider_enabled
-             FROM model_routes r JOIN providers p ON r.provider_id=p.id ORDER BY public_model",
-        )?;
+    fn query_routes(conn: &Connection, filter: &str, args: &[&dyn ToSql]) -> Result<Vec<Route>> {
+        let mut statement = conn.prepare(&format!("{ROUTE_SELECT} {filter}"))?;
         let routes = statement
-            .query_map([], |row| {
+            .query_map(args, |row| {
                 Ok(Route {
                     id: row.get("id")?,
                     public_model: row.get("public_model")?,
@@ -417,10 +495,14 @@ impl ConfigStore {
         Ok(routes)
     }
 
+    fn routes_with(conn: &Connection) -> Result<Vec<Route>> {
+        Self::query_routes(conn, "ORDER BY public_model", params![])
+    }
+
     fn route_with(conn: &Connection, id: &str) -> Result<Route> {
-        Self::routes_with(conn)?
+        Self::query_routes(conn, "WHERE r.id=?1", params![id])?
             .into_iter()
-            .find(|route| route.id == id)
+            .next()
             .ok_or_else(|| ApiError::not_found("model route not found"))
     }
 
@@ -467,7 +549,7 @@ impl ConfigStore {
         };
         let transaction = conn.transaction()?;
         match transaction.execute(sql, values) {
-            Ok(_) => transaction.commit()?,
+            Ok(_) => self.commit(transaction)?,
             Err(err) if is_constraint(&err) => {
                 return Err(ApiError::conflict("public_model is already mapped"))
             }
@@ -477,7 +559,10 @@ impl ConfigStore {
     }
 
     /// Each call takes one immutable snapshot; in-flight calls keep their original config.
-    pub fn resolve(&self, model: &str) -> Result<ResolvedRoute> {
+    pub fn resolve(&self, model: &str) -> Result<Arc<ResolvedRoute>> {
+        if let Some(route) = self.cache().get(model) {
+            return Ok(Arc::clone(route));
+        }
         let conn = self.lock();
         let found = conn
             .query_row(
@@ -504,99 +589,34 @@ impl ConfigStore {
                 "model_not_found",
             ));
         }
-        Ok(ResolvedRoute {
+        let route = Arc::new(ResolvedRoute {
             provider,
             upstream_model,
-        })
+        });
+        // Still under the connection lock: no write can commit between the read and this insert.
+        self.cache().insert(model.to_string(), Arc::clone(&route));
+        Ok(route)
     }
 
-    pub fn delete(&self, resource: &str, id: &str) -> Result<()> {
+    pub fn delete_provider(&self, id: &str) -> Result<()> {
         let mut conn = self.lock();
         let transaction = conn.transaction()?;
-        if resource == "providers" {
-            Self::provider_with(&transaction, &self.cipher, id, false)?;
-        } else {
-            Self::route_with(&transaction, id)?;
+        Self::provider_with(&transaction, &self.cipher, id, false)?;
+        match transaction.execute("DELETE FROM providers WHERE id=?1", params![id]) {
+            Ok(_) => self.commit(transaction),
+            Err(err) if is_constraint(&err) => Err(ApiError::conflict(
+                "delete or reassign this provider's model routes first",
+            )),
+            Err(err) => Err(err.into()),
         }
-        let sql = if resource == "providers" {
-            "DELETE FROM providers WHERE id=?1"
-        } else {
-            "DELETE FROM model_routes WHERE id=?1"
-        };
-        match transaction.execute(sql, params![id]) {
-            Ok(_) => transaction.commit()?,
-            Err(err) if is_constraint(&err) => {
-                return Err(ApiError::conflict(
-                    "delete or reassign this provider's model routes first",
-                ))
-            }
-            Err(err) => return Err(err.into()),
-        }
-        Ok(())
-    }
-}
-
-struct ProviderRow {
-    id: String,
-    name: String,
-    endpoint_url: String,
-    auth_type: String,
-    auth_header_name: String,
-    secret: String,
-    headers: String,
-    timeout_ms: i64,
-    enabled: bool,
-    log_request_body: bool,
-    log_response_body: bool,
-    created_at: String,
-    updated_at: String,
-}
-
-impl ProviderRow {
-    fn insert(&self, conn: &Connection) -> rusqlite::Result<usize> {
-        conn.execute(
-            "INSERT INTO providers (id, name, endpoint_url, auth_type, auth_header_name, secret, headers,
-             timeout_ms, enabled, log_request_body, log_response_body, created_at, updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
-            params![
-                self.id,
-                self.name,
-                self.endpoint_url,
-                self.auth_type,
-                self.auth_header_name,
-                self.secret,
-                self.headers,
-                self.timeout_ms,
-                self.enabled,
-                self.log_request_body,
-                self.log_response_body,
-                self.created_at,
-                self.updated_at
-            ],
-        )
     }
 
-    fn update(&self, conn: &Connection) -> rusqlite::Result<usize> {
-        conn.execute(
-            "UPDATE providers SET name=?2, endpoint_url=?3, auth_type=?4, auth_header_name=?5, secret=?6,
-             headers=?7, timeout_ms=?8, enabled=?9, log_request_body=?10, log_response_body=?11,
-             created_at=?12, updated_at=?13 WHERE id=?1",
-            params![
-                self.id,
-                self.name,
-                self.endpoint_url,
-                self.auth_type,
-                self.auth_header_name,
-                self.secret,
-                self.headers,
-                self.timeout_ms,
-                self.enabled,
-                self.log_request_body,
-                self.log_response_body,
-                self.created_at,
-                self.updated_at
-            ],
-        )
+    pub fn delete_route(&self, id: &str) -> Result<()> {
+        let mut conn = self.lock();
+        let transaction = conn.transaction()?;
+        Self::route_with(&transaction, id)?;
+        transaction.execute("DELETE FROM model_routes WHERE id=?1", params![id])?;
+        self.commit(transaction)
     }
 }
 
@@ -678,20 +698,16 @@ pub fn header_value(value: &Value) -> Result<String> {
     }
 }
 
-pub fn masked_header(name: &str, value: &Value) -> Value {
+/// Whether a header name suggests its value is a credential.
+pub fn is_secret_header(name: &str) -> bool {
     let lower = name.to_lowercase();
-    let secret = [
-        "authorization",
-        "api-key",
-        "api_key",
-        "apikey",
-        "token",
-        "secret",
-        "password",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle));
-    if secret {
+    SECRET_HEADER_WORDS
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+pub fn masked_header(name: &str, value: &Value) -> Value {
+    if is_secret_header(name) {
         Value::String("[saved]".to_string())
     } else {
         value.clone()

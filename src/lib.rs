@@ -17,10 +17,10 @@ use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::os::unix::io::AsRawFd;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -36,7 +36,13 @@ pub const MAX_LOG: usize = 2 * 1024 * 1024;
 
 const MAX_CONCURRENCY: usize = 32;
 const MAX_WORKERS: usize = 64;
+/// Total time allowed for the request line and headers, however slowly they trickle in.
 const HEADER_TIMEOUT: Duration = Duration::from_secs(15);
+/// Total time allowed for a request body once the headers have arrived.
+const BODY_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long shutdown waits for in-flight requests before exiting anyway.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(8);
+const LOG_RETENTION_DAYS: u32 = 30;
 const POLL_MILLIS: i32 = 200;
 
 const ADMIN_HTML: &str = include_str!("../static/admin.html");
@@ -57,6 +63,8 @@ pub struct App {
     pub max_body_bytes: usize,
     pub max_response_bytes: usize,
     pub max_log_bytes: usize,
+    pub header_timeout: Duration,
+    pub body_timeout: Duration,
 }
 
 impl App {
@@ -84,15 +92,24 @@ impl App {
         if admin_key == proxy_key {
             return Err("admin and client API keys must be different".to_string());
         }
+        let retention = match env::var("LLM_PROXY_LOG_RETENTION_DAYS") {
+            Ok(value) if !value.trim().is_empty() => value
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| "LLM_PROXY_LOG_RETENTION_DAYS must be a non-negative integer")?,
+            _ => LOG_RETENTION_DAYS,
+        };
         Ok(Self {
             store,
-            logger: CallLogger::open(log_dir).map_err(|error| error.message)?,
+            logger: CallLogger::open(log_dir, retention).map_err(|error| error.message)?,
             admin_key,
             proxy_key,
             calls: Semaphore::new(MAX_CONCURRENCY),
             max_body_bytes: MAX_BODY,
             max_response_bytes: MAX_RESPONSE,
             max_log_bytes: MAX_LOG,
+            header_timeout: HEADER_TIMEOUT,
+            body_timeout: BODY_TIMEOUT,
         })
     }
 }
@@ -111,41 +128,60 @@ fn key(supplied: Option<String>, variable: &str, path: &Path) -> io::Result<Stri
 
 /// Counting permits with non-blocking acquisition, matching the Python bounded semaphores.
 pub struct Semaphore {
-    used: Mutex<usize>,
+    used: AtomicUsize,
     max: usize,
+}
+
+/// A held permit; dropping it returns the permit even when the holder panics.
+#[must_use = "the permit is released as soon as it is dropped"]
+pub struct Permit<'a>(&'a Semaphore);
+
+impl Drop for Permit<'_> {
+    fn drop(&mut self) {
+        self.0.release();
+    }
 }
 
 impl Semaphore {
     pub fn new(max: usize) -> Self {
         Self {
-            used: Mutex::new(0),
+            used: AtomicUsize::new(0),
             max,
         }
     }
 
-    pub fn try_acquire(&self) -> bool {
-        let mut used = self.guard();
-        if *used < self.max {
-            *used += 1;
-            true
-        } else {
-            false
-        }
-    }
-
-    pub fn release(&self) {
-        let mut used = self.guard();
-        *used = used.saturating_sub(1);
+    pub fn try_acquire(&self) -> Option<Permit<'_>> {
+        // Lazily: an eagerly built permit would be dropped, releasing a slot, on failure.
+        self.take().then(|| Permit(self))
     }
 
     pub fn in_use(&self) -> usize {
-        *self.guard()
+        self.used.load(Ordering::Acquire)
     }
 
-    fn guard(&self) -> MutexGuard<'_, usize> {
+    fn take(&self) -> bool {
         self.used
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                (used < self.max).then_some(used + 1)
+            })
+            .is_ok()
+    }
+
+    fn release(&self) {
+        let _ = self
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                Some(used.saturating_sub(1))
+            });
+    }
+}
+
+/// A worker slot owned by a spawned thread; released when the thread ends or fails to start.
+struct WorkerSlot(Arc<Semaphore>);
+
+impl Drop for WorkerSlot {
+    fn drop(&mut self) {
+        self.0.release();
     }
 }
 
@@ -163,7 +199,6 @@ pub fn bind(host: &str, port: u16) -> io::Result<TcpListener> {
 pub fn serve(listener: TcpListener, app: Arc<App>) {
     install_signal_handlers();
     let workers = Arc::new(Semaphore::new(MAX_WORKERS));
-    let handles: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
     let descriptor = listener.as_raw_fd();
     if listener.set_nonblocking(true).is_err() {
         eprintln!("ERROR: the listener must support polling");
@@ -175,28 +210,19 @@ pub fn serve(listener: TcpListener, app: Arc<App>) {
         }
         match listener.accept() {
             Ok((stream, _peer)) => {
-                if !workers.try_acquire() {
+                if !workers.take() {
                     reject(stream);
                     continue;
                 }
+                let slot = WorkerSlot(Arc::clone(&workers));
                 let app = Arc::clone(&app);
-                let permits = Arc::clone(&workers);
-                let spawned = thread::Builder::new()
+                // A failed spawn drops the closure, and with it the slot.
+                let _ = thread::Builder::new()
                     .name("worker".to_string())
                     .spawn(move || {
-                        handle(app, stream);
-                        permits.release();
+                        let _slot = slot;
+                        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| handle(app, stream)));
                     });
-                match spawned {
-                    Ok(worker) => {
-                        let mut guard = handles
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        guard.retain(|finished| !finished.is_finished());
-                        guard.push(worker);
-                    }
-                    Err(_) => workers.release(),
-                }
             }
             Err(err)
                 if matches!(
@@ -209,12 +235,17 @@ pub fn serve(listener: TcpListener, app: Arc<App>) {
             }
         }
     }
-    for worker in handles
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .drain(..)
-    {
-        let _ = worker.join();
+    // Long streams can run for an hour; give in-flight calls a bounded grace period so the
+    // log queue is still drained before a container runtime escalates to SIGKILL.
+    let deadline = Instant::now() + SHUTDOWN_GRACE;
+    while workers.in_use() > 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    if workers.in_use() > 0 {
+        eprintln!(
+            "WARNING: exiting with {} request(s) still in flight",
+            workers.in_use()
+        );
     }
     app.logger.close();
 }
@@ -233,7 +264,7 @@ fn handle(app: Arc<App>, stream: TcpStream) {
     let Ok(mut conn) = Conn::new(stream, request_id.clone()) else {
         return;
     };
-    let _ = conn.set_read_timeout(Some(HEADER_TIMEOUT));
+    let _ = conn.set_read_deadline(Some(app.header_timeout));
     let _ = conn.set_write_timeout(Some(HEADER_TIMEOUT));
     let request = match conn.read_request() {
         Ok(Some(request)) => request,
@@ -371,25 +402,23 @@ impl Args {
         let mut data_dir = env::var("LLM_PROXY_DATA_DIR").unwrap_or_else(|_| "./data".to_string());
         let mut argv = env::args().skip(1);
         while let Some(argument) = argv.next() {
-            let (name, inline) = match argument.split_once('=') {
-                Some((name, value)) => (name.to_string(), Some(value.to_string())),
-                None => (argument.clone(), None),
-            };
-            let inline_value = inline.clone();
-            let value = match inline_value {
-                Some(value) => value,
-                None => argv
-                    .next()
-                    .unwrap_or_else(|| fail(&format!("{name} requires a value"))),
+            if matches!(argument.as_str(), "--help" | "-h") {
+                print!("{USAGE}");
+                std::process::exit(0);
+            }
+            let (name, value) = match argument.split_once('=') {
+                Some((name, value)) => (name.to_string(), value.to_string()),
+                None => {
+                    let value = argv
+                        .next()
+                        .unwrap_or_else(|| fail(&format!("{argument} requires a value")));
+                    (argument, value)
+                }
             };
             match name.as_str() {
                 "--host" => host = value,
                 "--port" => port = value,
                 "--data-dir" => data_dir = value,
-                "--help" | "-h" => {
-                    print!("{USAGE}");
-                    std::process::exit(0);
-                }
                 other => fail(&format!("unrecognized argument {other}")),
             }
         }
@@ -441,4 +470,31 @@ pub fn main() {
         println!("Client API token: {}", data.join("client.token").display());
     }
     serve(listener, app);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Semaphore;
+
+    #[test]
+    fn permits_are_returned_on_drop_and_on_panic() {
+        let permits = Semaphore::new(2);
+        let first = permits.try_acquire().expect("a permit");
+        let second = permits.try_acquire().expect("a permit");
+        assert!(permits.try_acquire().is_none());
+        drop(first);
+        assert_eq!(permits.in_use(), 1);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = permits.try_acquire().expect("a permit");
+            panic!("a failing call");
+        }));
+        assert!(result.is_err());
+        assert_eq!(
+            permits.in_use(),
+            1,
+            "the panicking holder released its permit"
+        );
+        drop(second);
+        assert_eq!(permits.in_use(), 0);
+    }
 }

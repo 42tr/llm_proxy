@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use llm_proxy::store::ResolvedRoute;
 use llm_proxy::{bind, serve, App};
@@ -78,18 +78,27 @@ fn upstream_response(mut stream: TcpStream) {
         let _ = stream.write_all(
             b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
         );
-        for chunk in [
+        // "slow" keeps streaming well past a short provider timeout.
+        let (count, pause) = if model == "slow" { (6, 150) } else { (1, 10) };
+        let chunks = std::iter::repeat_n(
             b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n".as_slice(),
-            b"data: [DONE]\n\n",
-        ] {
+            count,
+        )
+        .chain([b"data: [DONE]\n\n".as_slice()]);
+        for chunk in chunks {
             if stream.write_all(chunk).is_err() || stream.flush().is_err() {
                 return;
             }
-            thread::sleep(Duration::from_millis(10));
+            thread::sleep(Duration::from_millis(pause));
         }
         return;
     }
-    let body = json!({ "model": model, "choices": [] }).to_string();
+    let text = if model == "cjk" {
+        "中文".repeat(40)
+    } else {
+        String::new()
+    };
+    let body = json!({ "model": model, "choices": [], "text": text }).to_string();
     write_all(
         &mut stream,
         &format!(
@@ -144,16 +153,21 @@ struct Harness {
 
 impl Harness {
     fn new(tag: &str) -> Self {
+        Self::configured(tag, |_| {})
+    }
+
+    /// Start a proxy after adjusting the app's limits.
+    fn configured(tag: &str, configure: impl FnOnce(&mut App)) -> Self {
         let temp = TempDir::new(tag);
-        let app = Arc::new(
-            App::new(
-                &temp.join("proxy.sqlite3"),
-                &temp.join("logs"),
-                Some("admin".into()),
-                Some("client".into()),
-            )
-            .expect("the data directory must open"),
-        );
+        let mut app = App::new(
+            &temp.join("proxy.sqlite3"),
+            &temp.join("logs"),
+            Some("admin".into()),
+            Some("client".into()),
+        )
+        .expect("the data directory must open");
+        configure(&mut app);
+        let app = Arc::new(app);
         let upstream = fake_upstream();
         let listener = bind("127.0.0.1", 0).expect("a free port for the proxy");
         let port = listener.local_addr().expect("a local address").port();
@@ -180,12 +194,17 @@ impl Harness {
     }
 
     fn add_provider(&self, name: &str, body_logging: bool) -> String {
+        self.add_provider_with_timeout(name, body_logging, 120_000)
+    }
+
+    fn add_provider_with_timeout(&self, name: &str, body_logging: bool, timeout_ms: u64) -> String {
         let provider = json!({
             "name": name,
             "endpoint_url": format!("http://127.0.0.1:{}/v1/chat/completions", self.upstream),
             "auth_type": "none",
             "log_response_body": body_logging,
             "log_request_body": body_logging,
+            "timeout_ms": timeout_ms,
         });
         let saved = self
             .app
@@ -227,6 +246,31 @@ impl Harness {
         let reply = self.admin("GET", path, None, Some("admin"));
         assert_eq!(reply.status, 200, "GET {path} failed: {}", reply.body);
         reply.json()
+    }
+
+    /// Today's log listing, retried until the asynchronous logger has written `request_id`.
+    fn logged(&self, request_id: &str) -> Value {
+        for _ in 0..50 {
+            let listing = self.admin_json("/api/admin/logs?limit=50");
+            if let Some(item) = listing["items"]
+                .as_array()
+                .expect("items")
+                .iter()
+                .find(|item| item["request_id"] == json!(request_id))
+            {
+                return item.clone();
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!("{request_id} was not logged");
+    }
+
+    fn port(&self) -> u16 {
+        self.base
+            .rsplit(':')
+            .next()
+            .and_then(|port| port.parse().ok())
+            .expect("a port")
     }
 }
 
@@ -475,6 +519,25 @@ fn admin_can_add_mapping_without_restart() {
             .status,
         401
     );
+
+    // A resolved route is cached; editing it must take effect on the very next call.
+    let route_id = created.json()["id"]
+        .as_str()
+        .expect("a route id")
+        .to_string();
+    let disabled = harness.admin(
+        "PUT",
+        &format!("/api/admin/model-routes/{route_id}"),
+        Some(&json!({ "public_model": "second", "provider_id": provider_id, "upstream_model": "second-up", "enabled": false })),
+        Some("admin"),
+    );
+    assert_eq!(disabled.status, 200, "{}", disabled.body);
+    let gone = harness.chat(
+        json!({ "model": "second", "messages": messages() }),
+        "client",
+    );
+    assert_eq!(gone.status, 404);
+    assert_eq!(gone.error_kind(), "model_not_found");
 }
 
 #[test]
@@ -691,11 +754,33 @@ fn admin_can_read_call_logs_by_date() {
         .iter()
         .any(|item| *item == json!(today)));
 
-    let logged = items[0]["response"]
-        .as_object()
-        .expect("a captured response");
+    assert!(
+        items[0].get("response").is_none() && items[0].get("request").is_none(),
+        "listings leave out captured bodies"
+    );
+    let detail = harness.admin_json(&format!(
+        "/api/admin/logs/{}?date={today}",
+        reply.request_id
+    ));
+    assert_eq!(detail["request_id"], json!(reply.request_id));
+    let logged = detail["response"].as_object().expect("a captured response");
     assert_eq!(logged["encoding"], json!("utf-8"));
     assert!(logged["body"].as_str().expect("a body").contains("up-demo"));
+    assert!(detail["request"]["body"]
+        .as_str()
+        .expect("a request body")
+        .contains("\"model\":\"demo\""));
+    assert_eq!(
+        harness
+            .admin(
+                "GET",
+                &format!("/api/admin/logs/req_missing?date={today}"),
+                None,
+                Some("admin")
+            )
+            .status,
+        404
+    );
 
     // A well formed but unused day is an empty result, not an error.
     let empty = harness.admin_json(&format!("/api/admin/logs?date={}", "2001-02-03"));
@@ -745,22 +830,19 @@ fn concurrency_limit_is_enforced_and_released() {
         upstream_model: "up-demo".to_string(),
     };
     // Fill the permit pool, then confirm a call is refused and permits are released afterwards.
-    let held: Vec<bool> = (0..32).map(|_| harness.app.calls.try_acquire()).collect();
+    let held: Vec<_> = (0..32).map(|_| harness.app.calls.try_acquire()).collect();
     assert!(
-        held.iter().all(|acquired| *acquired),
+        held.iter().all(Option::is_some),
         "32 permits must be available"
     );
     assert!(
-        !harness.app.calls.try_acquire(),
+        harness.app.calls.try_acquire().is_none(),
         "the 33rd permit must be refused"
     );
     let refused = harness.chat(json!({ "model": "demo", "messages": messages() }), "client");
     assert_eq!(refused.status, 429);
     assert_eq!(refused.error_kind(), "rate_limit_error");
     drop(held);
-    for _ in 0..32 {
-        harness.app.calls.release();
-    }
     assert_eq!(harness.app.calls.in_use(), 0);
     assert_eq!(
         harness
@@ -795,31 +877,13 @@ fn request_body_limits_are_enforced() {
     );
     assert_eq!(wrong_type.status, 200);
 
-    let mut stream = TcpStream::connect(format!(
-        "127.0.0.1:{}",
-        harness
-            .base
-            .rsplit(':')
-            .next()
-            .unwrap()
-            .trim_end_matches('/')
-    ))
-    .expect("a connection");
+    let mut stream = TcpStream::connect(("127.0.0.1", harness.port())).expect("a connection");
     let _ = stream.write_all(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer client\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\n{}");
     let mut text = String::new();
     let _ = stream.read_to_string(&mut text);
     assert!(text.starts_with("HTTP/1.1 415"), "unexpected reply: {text}");
 
-    let mut stream = TcpStream::connect(format!(
-        "127.0.0.1:{}",
-        harness
-            .base
-            .rsplit(':')
-            .next()
-            .unwrap()
-            .trim_end_matches('/')
-    ))
-    .expect("a connection");
+    let mut stream = TcpStream::connect(("127.0.0.1", harness.port())).expect("a connection");
     let _ = stream.write_all(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer client\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n");
     let mut text = String::new();
     let _ = stream.read_to_string(&mut text);
@@ -914,4 +978,96 @@ fn store_persists_configuration_across_reopen() {
 
     let map: Map<String, Value> = Map::new();
     assert!(reopened.store.save_provider(&map, None).is_err());
+}
+
+#[test]
+fn streams_may_outlast_the_provider_timeout() {
+    let harness = Harness::new("slow-stream");
+    let provider = harness.add_provider_with_timeout("fake", false, 300);
+    harness.add_route("slow", "slow", &provider);
+    let started = Instant::now();
+    let reply = harness.chat(
+        json!({ "model": "slow", "messages": messages(), "stream": true }),
+        "client",
+    );
+    assert!(
+        started.elapsed() > Duration::from_millis(600),
+        "the fake stream is slower than the provider timeout"
+    );
+    assert_eq!(reply.status, 200);
+    assert!(
+        reply.body.contains("data: [DONE]"),
+        "the stream was cut off: {}",
+        reply.body
+    );
+    let item = harness.logged(&reply.request_id);
+    assert_eq!(item["outcome"], json!("completed"));
+    assert!(
+        item["error"].is_null(),
+        "unexpected error: {}",
+        item["error"]
+    );
+}
+
+#[test]
+fn slow_request_headers_are_bounded_in_total() {
+    let harness = Harness::configured("slowloris", |app| {
+        app.header_timeout = Duration::from_millis(500);
+    });
+    let mut stream = TcpStream::connect(("127.0.0.1", harness.port())).expect("a connection");
+    let mut writer = stream.try_clone().expect("a writer");
+    // Every write arrives well within a per-read timeout, but the headers never finish.
+    thread::spawn(move || {
+        let _ = writer.write_all(b"GET /healthz HTTP/1.1\r\n");
+        for _ in 0..30 {
+            thread::sleep(Duration::from_millis(100));
+            if writer.write_all(b"X-Slow: 1\r\n").is_err() {
+                return;
+            }
+        }
+    });
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("a read timeout");
+    let started = Instant::now();
+    let mut text = String::new();
+    let _ = stream.read_to_string(&mut text);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the connection was held for {:?}",
+        started.elapsed()
+    );
+    assert!(text.is_empty(), "no response is sent: {text}");
+}
+
+#[test]
+fn truncated_logs_keep_multibyte_text_readable() {
+    let harness = Harness::configured("cjk-log", |app| {
+        app.max_log_bytes = 51;
+    });
+    let provider = harness.add_provider("fake", true);
+    harness.add_route("cjk", "cjk", &provider);
+    let reply = harness.chat(json!({ "model": "cjk", "messages": messages() }), "client");
+    assert_eq!(reply.status, 200);
+    harness.logged(&reply.request_id);
+    let detail = harness.admin_json(&format!("/api/admin/logs/{}", reply.request_id));
+    let response = &detail["response"];
+    assert_eq!(response["encoding"], json!("utf-8"), "{response}");
+    assert_eq!(response["truncated"], json!(true));
+    assert_eq!(response["bytes"], json!(reply.body.len()));
+    let body = response["body"].as_str().expect("a body");
+    assert!(body.len() <= 51 && body.contains('中'), "{body}");
+}
+
+#[test]
+fn log_queries_with_raw_non_ascii_do_not_crash() {
+    let harness = Harness::with_demo("query-utf8");
+    let mut stream = TcpStream::connect(("127.0.0.1", harness.port())).expect("a connection");
+    let _ = stream.write_all(
+        "GET /api/admin/logs?q=%中文 HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer admin\r\n\r\n"
+            .as_bytes(),
+    );
+    let mut text = String::new();
+    let _ = stream.read_to_string(&mut text);
+    assert!(text.starts_with("HTTP/1.1 200"), "unexpected reply: {text}");
 }

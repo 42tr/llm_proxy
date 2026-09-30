@@ -8,6 +8,22 @@ use crate::store::{text_field, ResolvedRoute};
 use crate::util::now;
 use crate::App;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Resource {
+    Providers,
+    Routes,
+}
+
+impl Resource {
+    fn parse(segment: &str) -> Option<Self> {
+        match segment {
+            "providers" => Some(Self::Providers),
+            "model-routes" => Some(Self::Routes),
+            _ => None,
+        }
+    }
+}
+
 pub fn dispatch(
     app: &App,
     method: &str,
@@ -15,45 +31,51 @@ pub fn dispatch(
     request: &Request,
     conn: &mut Conn,
 ) -> Result<()> {
-    if parts == ["access"] && method == "GET" {
-        return respond(conn, 200, &json!({ "client_api_key": app.proxy_key }));
-    }
-    if parts == ["logs"] && method == "GET" {
-        return logs(app, request, conn);
+    match (method, parts) {
+        ("GET", ["access"]) => {
+            return respond(conn, 200, &json!({ "client_api_key": app.proxy_key }));
+        }
+        ("GET", ["logs"]) => return logs(app, request, conn),
+        ("GET", ["logs", request_id]) => {
+            let record = app.logger.read_record(&log_day(request), request_id)?;
+            return respond(conn, 200, &record);
+        }
+        _ => {}
     }
     let Some((resource, rest)) = parts.split_first() else {
         return Err(ApiError::not_found("not found"));
     };
-    if !matches!(*resource, "providers" | "model-routes") || rest.len() > 2 {
+    let Some(resource) = Resource::parse(resource).filter(|_| rest.len() <= 2) else {
         return Err(ApiError::not_found("not found"));
-    }
-    if rest.len() == 2 {
-        if *resource == "providers" && rest[1] == "test" && method == "POST" {
-            return test_provider(app, rest[0], request, conn);
+    };
+    if let [id, action] = rest {
+        if resource == Resource::Providers && *action == "test" && method == "POST" {
+            return test_provider(app, id, request, conn);
         }
         return Err(ApiError::not_found("not found"));
     }
     let item_id = rest.first().copied();
     match (method, item_id) {
         ("GET", None) => {
-            let items = if *resource == "providers" {
-                serde_json::to_value(app.store.providers()?)?
-            } else {
-                serde_json::to_value(app.store.routes()?)?
+            let items = match resource {
+                Resource::Providers => serde_json::to_value(app.store.providers()?)?,
+                Resource::Routes => serde_json::to_value(app.store.routes()?)?,
             };
             respond(conn, 200, &json!({ "items": items }))
         }
         ("GET", Some(id)) => {
-            let item = if *resource == "providers" {
-                serde_json::to_value(app.store.provider(id, false)?)?
-            } else {
-                serde_json::to_value(app.store.route(id)?)?
+            let item = match resource {
+                Resource::Providers => serde_json::to_value(app.store.provider(id, false)?)?,
+                Resource::Routes => serde_json::to_value(app.store.route(id)?)?,
             };
             respond(conn, 200, &item)
         }
         ("POST", None) | ("PUT", Some(_)) => save(app, resource, item_id, request, conn),
         ("DELETE", Some(id)) => {
-            app.store.delete(resource, id)?;
+            match resource {
+                Resource::Providers => app.store.delete_provider(id)?,
+                Resource::Routes => app.store.delete_route(id)?,
+            }
             let _ = conn.send_empty(204);
             Ok(())
         }
@@ -67,16 +89,15 @@ pub fn dispatch(
 
 fn save(
     app: &App,
-    resource: &str,
+    resource: Resource,
     item_id: Option<&str>,
     request: &Request,
     conn: &mut Conn,
 ) -> Result<()> {
     let map = body(request, conn, app)?;
-    let saved = if resource == "providers" {
-        serde_json::to_value(app.store.save_provider(&map, item_id)?)?
-    } else {
-        serde_json::to_value(app.store.save_route(&map, item_id)?)?
+    let saved = match resource {
+        Resource::Providers => serde_json::to_value(app.store.save_provider(&map, item_id)?)?,
+        Resource::Routes => serde_json::to_value(app.store.save_route(&map, item_id)?)?,
     };
     respond(conn, if item_id.is_some() { 200 } else { 201 }, &saved)
 }
@@ -103,10 +124,14 @@ fn test_provider(app: &App, id: &str, request: &Request, conn: &mut Conn) -> Res
     Ok(())
 }
 
-fn logs(app: &App, request: &Request, conn: &mut Conn) -> Result<()> {
-    let day = request
+/// The `date` query parameter, defaulting to today (UTC).
+fn log_day(request: &Request) -> String {
+    request
         .query_param("date")
-        .unwrap_or_else(|| now()[..10].to_string());
+        .unwrap_or_else(|| now()[..10].to_string())
+}
+
+fn logs(app: &App, request: &Request, conn: &mut Conn) -> Result<()> {
     let term = request.query_param("q").unwrap_or_default();
     let limit = match request.query_param("limit") {
         None => 100,
@@ -116,12 +141,12 @@ fn logs(app: &App, request: &Request, conn: &mut Conn) -> Result<()> {
             Err(_) => return Err(ApiError::bad("limit must be an integer")),
         },
     };
-    let result = app.logger.read_day(&day, limit, &term)?;
+    let result = app.logger.read_day(&log_day(request), limit, &term)?;
     respond(conn, 200, &result)
 }
 
 fn body(request: &Request, conn: &mut Conn, app: &App) -> Result<serde_json::Map<String, Value>> {
-    match conn.read_json(request, app.max_body_bytes)? {
+    match conn.read_json(request, app.max_body_bytes, app.body_timeout)? {
         Value::Object(map) => Ok(map),
         _ => Err(ApiError::bad("request body must be a JSON object")),
     }

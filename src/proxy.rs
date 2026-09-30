@@ -1,19 +1,26 @@
 //! OpenAI compatible `chat/completions` forwarding with unbuffered SSE passthrough.
 use std::collections::HashMap;
 use std::io::{self, Read};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use memchr::memmem;
 use serde_json::{Map, Value};
 use ureq::Agent;
 
 use crate::error::ApiError;
-use crate::http::{authorized, is_disconnect, is_timeout, Conn, Request};
-use crate::logs::{Capture, Record};
-use crate::store::{text_field, ResolvedRoute};
-use crate::App;
+use crate::http::{authorized, is_disconnect, is_timeout, parse_object, Conn, Request};
+use crate::logs::{CaptureExport, Record};
+use crate::store::{is_secret_header, text_field, AuthType, ResolvedRoute};
+use crate::{App, Permit};
 
 const MAX_CHUNK: usize = 32 * 1024;
+/// Upper bound for the body of a streamed response. The provider timeout only bounds the
+/// wait for the response headers, so long generations are not cut off mid-stream.
+pub const STREAM_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+/// Credentials shorter than this are not scrubbed from logged bodies: masking them would
+/// mangle ordinary text far more often than it would hide a real secret.
+const MIN_MASKED_SECRET: usize = 8;
 /// Header names whose values are replaced with `[REDACTED]` in logged bodies.
 const SECRET_NAMES: [&str; 8] = [
     "authorization",
@@ -53,16 +60,17 @@ pub fn chat(app: &App, request: &Request, conn: &mut Conn, supplied: Option<Supp
     } else {
         "client"
     };
-    let request_id = conn.request_id.clone();
+    let record = Record::new(&conn.request_id, source);
     let mut call = Call {
         app,
         conn,
-        record: Record::new(&request_id, source),
+        record,
         route: None,
         payload: None,
-        capture: None,
-        acquired: false,
+        response: Vec::new(),
+        log_response: false,
         started: Instant::now(),
+        permit: None,
     };
     let fault = call.run(request, supplied).err();
     call.finish(fault);
@@ -72,19 +80,23 @@ struct Call<'a> {
     app: &'a App,
     conn: &'a mut Conn,
     record: Record,
-    route: Option<ResolvedRoute>,
+    route: Option<Arc<ResolvedRoute>>,
     payload: Option<Value>,
-    capture: Option<Capture>,
-    acquired: bool,
+    /// The buffered response body, or for streams the first `max_log_bytes` of it when logged.
+    response: Vec<u8>,
+    log_response: bool,
     started: Instant,
+    /// Held for the whole call and released on drop, even if the call panics.
+    permit: Option<Permit<'a>>,
 }
 
 impl Call<'_> {
     fn run(&mut self, request: &Request, supplied: Option<Supplied>) -> Result<(), Fault> {
-        let payload = match supplied {
+        let (mut payload, request_bytes) = match supplied {
             Some(supplied) => {
-                self.route = Some(supplied.route);
-                supplied.payload
+                self.route = Some(Arc::new(supplied.route));
+                let bytes = compact(&supplied.payload).len();
+                (supplied.payload, bytes)
             }
             None => {
                 if !authorized(request, &self.app.proxy_key) {
@@ -92,12 +104,15 @@ impl Call<'_> {
                         "client authorization required",
                     )));
                 }
-                self.conn
-                    .read_json(request, self.app.max_body_bytes)
-                    .map_err(Fault::Api)?
+                let raw = self
+                    .conn
+                    .read_body(request, self.app.max_body_bytes, self.app.body_timeout)
+                    .map_err(Fault::Api)?;
+                (parse_object(&raw).map_err(Fault::Api)?, raw.len())
             }
         };
-        let Value::Object(map) = &payload else {
+        self.record.request_bytes = request_bytes;
+        let Value::Object(map) = &mut payload else {
             return Err(Fault::Api(ApiError::bad(
                 "request body must be a JSON object",
             )));
@@ -113,42 +128,35 @@ impl Call<'_> {
                 "messages must be a non-empty array",
             )));
         }
-        // Header and body parsing has completed; long-running streams should not be
-        // terminated by the request-header timeout.
-        let _ = self.conn.set_read_timeout(None);
         self.record.model = Some(model.clone());
         self.record.stream = stream;
-        self.record.request_bytes = compact(&payload).len();
-        if self.route.is_none() {
-            self.route = Some(self.app.store.resolve(&model).map_err(Fault::Api)?);
-        }
-        let route = self.route.clone().expect("route resolved above");
+        let route = match &self.route {
+            Some(route) => Arc::clone(route),
+            None => self.app.store.resolve(&model).map_err(Fault::Api)?,
+        };
+        self.route = Some(Arc::clone(&route));
         self.record.provider_id = Some(route.provider_id().to_string());
         self.record.upstream_model = Some(route.upstream_model.clone());
-        if !self.app.calls.try_acquire() {
+        let Some(permit) = self.app.calls.try_acquire() else {
             return Err(Fault::Api(ApiError::new(
                 429,
                 "proxy concurrency limit reached",
                 "rate_limit_error",
             )));
-        }
-        self.acquired = true;
+        };
+        self.permit = Some(permit);
         let _ = self
             .conn
             .set_write_timeout(Some(route.timeout().max(Duration::from_secs(5))));
-        self.capture = Some(Capture::new(
-            self.app.max_log_bytes,
-            route.provider.log_response_body,
-        ));
-        let body = upstream_body(map, &route);
+        self.log_response = route.provider.log_response_body;
+        let body = upstream_body(map, &route.upstream_model);
         self.payload = Some(payload);
         self.forward(&route, stream, body)
     }
 
     fn forward(&mut self, route: &ResolvedRoute, stream: bool, body: Vec<u8>) -> Result<(), Fault> {
-        let timeout = route.provider.timeout_ms.max(0) as u64;
-        let agent = agent_for(timeout);
-        let mut request = agent
+        let timeout = route.timeout();
+        let mut request = agent_for(timeout, stream)
             .post(&route.provider.endpoint_url)
             .header("Content-Type", "application/json")
             .header("Accept-Encoding", "identity")
@@ -163,18 +171,21 @@ impl Call<'_> {
         for (name, value) in route.extra_headers() {
             request = request.header(name, value);
         }
-        request = match route.provider.auth_type.as_str() {
-            "bearer" => request.header("Authorization", format!("Bearer {}", route.api_key())),
-            "api_key" => request.header("api-key", route.api_key()),
-            "custom_header" => {
+        request = match route.provider.auth_type {
+            AuthType::Bearer => {
+                request.header("Authorization", format!("Bearer {}", route.api_key()))
+            }
+            AuthType::ApiKey => request.header("api-key", route.api_key()),
+            AuthType::CustomHeader => {
                 request.header(route.provider.auth_header_name.as_str(), route.api_key())
             }
-            _ => request,
+            AuthType::None => request,
         };
-        let deadline = self.started + route.timeout();
+        let headers_by = self.started + timeout;
         let response = request
             .send(body.as_slice())
-            .map_err(|err| classify(err, deadline))?;
+            .map_err(|err| classify(err, headers_by))?;
+        drop(body);
         let status = response.status().as_u16();
         self.record.upstream_status = Some(status);
         let (content_type, extra) = forwarded_headers(response.headers());
@@ -184,11 +195,32 @@ impl Call<'_> {
             .unwrap_or("")
             .trim()
             .eq_ignore_ascii_case("text/event-stream");
+        let deadline = if stream {
+            Instant::now() + STREAM_TIMEOUT
+        } else {
+            headers_by
+        };
         let mut reader = response.into_body().into_reader();
         if is_sse {
-            self.stream_body(&mut reader, status, &content_type, &extra, deadline)?;
+            self.conn
+                .start_response(status, &content_type, "no-cache", None, &extra)
+                .map_err(write_fault)?;
+            self.record.status = status;
+            self.pump(&mut reader, deadline, true)?;
         } else {
-            self.buffer_body(&mut reader, status, &content_type, &extra, deadline)?;
+            // Buffered so the upstream status and body can be forwarded verbatim.
+            self.pump(&mut reader, deadline, false)?;
+            self.conn
+                .start_response(
+                    status,
+                    &content_type,
+                    "no-cache",
+                    Some(self.response.len()),
+                    &extra,
+                )
+                .map_err(write_fault)?;
+            self.record.status = status;
+            self.conn.write_chunk(&self.response).map_err(write_fault)?;
         }
         self.record.outcome = if status < 400 {
             "completed"
@@ -198,194 +230,145 @@ impl Call<'_> {
         Ok(())
     }
 
-    /// Forward SSE chunks as they arrive; close-delimited framing keeps latency flat.
-    fn stream_body(
+    /// Read the upstream body until EOF. Streamed chunks are forwarded as they arrive
+    /// (close-delimited framing keeps latency flat); otherwise the body is buffered.
+    fn pump(
         &mut self,
         reader: &mut impl Read,
-        status: u16,
-        content_type: &str,
-        extra: &[(String, String)],
         deadline: Instant,
+        stream: bool,
     ) -> Result<(), Fault> {
-        self.conn
-            .start_response(status, content_type, "no-cache", None, extra)
-            .map_err(|err| {
-                if is_disconnect(&err) {
-                    Fault::ClientGone
-                } else {
-                    Fault::Upstream
-                }
-            })?;
-        self.record.status = status;
         let mut buffer = vec![0u8; MAX_CHUNK];
         loop {
             if Instant::now() >= deadline {
                 return Err(Fault::Timeout);
             }
-            match reader.read(&mut buffer) {
+            let len = match reader.read(&mut buffer) {
                 Ok(0) => return Ok(()),
-                Ok(len) => {
-                    let chunk = &buffer[..len];
-                    self.note_first_byte();
-                    if self.over_size_limit(chunk) {
-                        return Err(Fault::Api(ApiError::new(
-                            502,
-                            "upstream response exceeds size limit",
-                            "response_too_large",
-                        )));
-                    }
-                    if let Err(err) = self.conn.write_chunk(chunk) {
-                        return Err(if is_disconnect(&err) {
-                            Fault::ClientGone
-                        } else {
-                            Fault::Upstream
-                        });
-                    }
-                }
+                Ok(len) => len,
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                 Err(err) => return Err(classify_io(&err, deadline)),
+            };
+            let chunk = &buffer[..len];
+            if self.record.first_byte_latency_ms.is_none() {
+                self.record.first_byte_latency_ms = Some(self.started.elapsed().as_millis() as u64);
             }
+            self.record.response_bytes += len;
+            if self.record.response_bytes > self.app.max_response_bytes {
+                return Err(Fault::Api(ApiError::new(
+                    502,
+                    "upstream response exceeds size limit",
+                    "response_too_large",
+                )));
+            }
+            if !stream {
+                self.response.extend_from_slice(chunk);
+                continue;
+            }
+            if self.log_response {
+                let room = self
+                    .app
+                    .max_log_bytes
+                    .saturating_sub(self.response.len())
+                    .min(len);
+                self.response.extend_from_slice(&chunk[..room]);
+            }
+            self.conn.write_chunk(chunk).map_err(write_fault)?;
         }
     }
 
-    /// Non-stream responses are buffered so the upstream status and body can be forwarded verbatim.
-    fn buffer_body(
-        &mut self,
-        reader: &mut impl Read,
-        status: u16,
-        content_type: &str,
-        extra: &[(String, String)],
-        deadline: Instant,
-    ) -> Result<(), Fault> {
-        let mut body = Vec::new();
-        let mut buffer = vec![0u8; MAX_CHUNK];
-        loop {
-            if Instant::now() >= deadline {
-                return Err(Fault::Timeout);
-            }
-            match reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(len) => {
-                    let chunk = &buffer[..len];
-                    self.note_first_byte();
-                    if self.over_size_limit(chunk) {
-                        return Err(Fault::Api(ApiError::new(
-                            502,
-                            "upstream response exceeds size limit",
-                            "response_too_large",
-                        )));
-                    }
-                    body.extend_from_slice(chunk);
-                }
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                Err(err) => return Err(classify_io(&err, deadline)),
-            }
+    fn finish(mut self, fault: Option<Fault>) {
+        if let Some(fault) = fault {
+            self.report(fault);
         }
-        self.conn
-            .start_response(status, content_type, "no-cache", Some(body.len()), extra)
-            .map_err(|err| {
-                if is_disconnect(&err) {
-                    Fault::ClientGone
-                } else {
-                    Fault::Upstream
-                }
-            })?;
-        self.record.status = status;
-        self.conn.write_chunk(&body).map_err(|err| {
-            if is_disconnect(&err) {
-                Fault::ClientGone
-            } else {
-                Fault::Upstream
-            }
-        })
-    }
-
-    fn note_first_byte(&mut self) {
-        if self.record.first_byte_latency_ms.is_none() {
-            self.record.first_byte_latency_ms = Some(self.started.elapsed().as_millis() as u64);
+        // Return the permit before the comparatively slow log serialization.
+        self.permit = None;
+        self.record.latency_ms = self.started.elapsed().as_millis() as u64;
+        if let Some(route) = self.route.take() {
+            self.capture_bodies(&route);
         }
+        self.app.logger.write(self.record);
     }
 
-    /// Add a chunk to the capture and report whether the response grew past the hard limit.
-    fn over_size_limit(&mut self, chunk: &[u8]) -> bool {
-        let Some(capture) = self.capture.as_mut() else {
-            return false;
-        };
-        capture.add(chunk);
-        capture.total > self.app.max_response_bytes
-    }
-
-    fn finish(&mut self, fault: Option<Fault>) {
-        match fault {
-            None => {}
-            Some(Fault::Api(error)) => {
-                self.record.error = Some(error.kind.to_string());
-                if !self.conn.sent() {
-                    self.record.status = error.status;
-                }
-                self.conn.fail(&error);
-            }
-            Some(Fault::ClientGone) => {
-                self.record.error = Some("client_disconnected".to_string());
-                if !self.conn.sent() {
-                    self.record.status = 499;
-                }
-            }
-            Some(Fault::Timeout) => {
-                self.record.error = Some("upstream_timeout".to_string());
-                if !self.conn.sent() {
-                    self.record.status = 504;
-                }
-                self.conn.fail(&ApiError::new(
+    /// Record the failure and tell the client, unless a response has already started.
+    fn report(&mut self, fault: Fault) {
+        let (kind, status, error) = match fault {
+            Fault::Api(error) => (error.kind, error.status, Some(error)),
+            Fault::ClientGone => ("client_disconnected", 499, None),
+            Fault::Timeout => (
+                "upstream_timeout",
+                504,
+                Some(ApiError::new(
                     504,
                     "upstream request timed out",
                     "upstream_timeout",
-                ));
-            }
-            Some(Fault::Upstream) => {
-                self.record.error = Some("upstream_error".to_string());
-                if !self.conn.sent() {
-                    self.record.status = 502;
-                }
-                self.conn.fail(&ApiError::new(
+                )),
+            ),
+            Fault::Upstream => (
+                "upstream_error",
+                502,
+                Some(ApiError::new(
                     502,
                     "upstream request failed",
                     "upstream_error",
+                )),
+            ),
+        };
+        self.record.error = Some(kind.to_string());
+        if !self.conn.sent() {
+            self.record.status = status;
+        }
+        if let Some(error) = error {
+            self.conn.fail(&error);
+        }
+    }
+
+    /// Attach redacted request and response bodies when the provider asks for them.
+    fn capture_bodies(&mut self, route: &ResolvedRoute) {
+        let limit = self.app.max_log_bytes;
+        if route.provider.log_request_body {
+            if let Some(mut payload) = self.payload.take() {
+                redact(&mut payload);
+                let masked = mask_secrets(compact(&payload), route);
+                self.record.request = Some(CaptureExport::new(
+                    &masked,
+                    self.record.request_bytes,
+                    true,
+                    limit,
                 ));
             }
         }
-        if self.acquired {
-            self.app.calls.release();
-        }
-        self.record.latency_ms = self.started.elapsed().as_millis() as u64;
-        if let (Some(route), Some(payload)) = (self.route.take(), self.payload.take()) {
-            if route.provider.log_request_body {
-                let mut capture = Capture::new(self.app.max_log_bytes, true);
-                let redacted = compact(&redact(&payload));
-                capture.add(&mask_secrets(&redacted, &route));
-                self.record.request = Some(capture.export());
-            }
-            if let Some(capture) = self.capture.take() {
-                self.record.response_bytes = capture.total;
-                if route.provider.log_response_body {
-                    // Redact structured secret fields where a complete JSON response is available.
-                    let raw = serde_json::from_slice::<Value>(&capture.data)
-                        .map(|value| compact(&redact(&value)))
-                        .unwrap_or_else(|_| capture.data.clone());
-                    let masked = mask_secrets(&raw, &route);
-                    self.record.response = Some(
-                        capture
-                            .export_replaced(&masked[..masked.len().min(self.app.max_log_bytes)]),
-                    );
+        if route.provider.log_response_body {
+            let body = std::mem::take(&mut self.response);
+            let complete = body.len() == self.record.response_bytes;
+            // Redact structured secret fields where a complete, reasonably sized JSON body is
+            // available; anything else only has the known credentials scrubbed.
+            let parsed = (complete && body.len() <= limit)
+                .then(|| serde_json::from_slice::<Value>(&body).ok())
+                .flatten();
+            let raw = match parsed {
+                Some(mut value) => {
+                    redact(&mut value);
+                    compact(&value)
                 }
-            }
-            self.route = Some(route);
+                None => body,
+            };
+            let masked = mask_secrets(raw, route);
+            self.record.response = Some(CaptureExport::new(
+                &masked,
+                self.record.response_bytes,
+                complete,
+                limit,
+            ));
         }
-        let record = std::mem::replace(
-            &mut self.record,
-            Record::new(&self.conn.request_id, "client"),
-        );
-        self.app.logger.write(record);
+    }
+}
+
+fn write_fault(err: io::Error) -> Fault {
+    if is_disconnect(&err) {
+        Fault::ClientGone
+    } else {
+        Fault::Upstream
     }
 }
 
@@ -408,14 +391,20 @@ fn classify_io(err: &io::Error, deadline: Instant) -> Fault {
     }
 }
 
-/// Rewrite the client model to the upstream model, leaving everything else untouched.
-fn upstream_body(payload: &Map<String, Value>, route: &ResolvedRoute) -> Vec<u8> {
-    let mut body = payload.clone();
-    body.insert(
+/// Serialize the payload with the upstream model, leaving everything else untouched.
+///
+/// The model is swapped in place and restored afterwards instead of cloning a body that may
+/// be megabytes large; key order is preserved, so the field keeps its position.
+fn upstream_body(payload: &mut Map<String, Value>, upstream_model: &str) -> Vec<u8> {
+    let original = payload.insert(
         "model".to_string(),
-        Value::String(route.upstream_model.clone()),
+        Value::String(upstream_model.to_string()),
     );
-    compact(&Value::Object(body))
+    let body = serde_json::to_vec(payload).unwrap_or_default();
+    if let Some(original) = original {
+        payload.insert("model".to_string(), original);
+    }
+    body
 }
 
 fn compact(value: &Value) -> Vec<u8> {
@@ -447,85 +436,124 @@ fn forwarded_headers(headers: &ureq::http::HeaderMap) -> (String, Vec<(String, S
     (content_type, extra)
 }
 
-fn redact(value: &Value) -> Value {
+/// Replace the values of secret-looking keys, in place, anywhere in the document.
+fn redact(value: &mut Value) {
     match value {
-        Value::Object(map) => Value::Object(
-            map.iter()
-                .map(|(key, item)| {
-                    let hidden = SECRET_NAMES.contains(&key.to_lowercase().as_str());
-                    (
-                        key.clone(),
-                        if hidden {
-                            Value::String("[REDACTED]".to_string())
-                        } else {
-                            redact(item)
-                        },
-                    )
-                })
-                .collect(),
-        ),
-        Value::Array(items) => Value::Array(items.iter().map(redact).collect()),
-        other => other.clone(),
+        Value::Object(map) => {
+            for (key, item) in map.iter_mut() {
+                if SECRET_NAMES.contains(&key.to_lowercase().as_str()) {
+                    *item = Value::String("[REDACTED]".to_string());
+                } else {
+                    redact(item);
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(redact),
+        _ => {}
     }
 }
 
-/// Scrub the upstream credential and configured header values out of a logged body.
-fn mask_secrets(data: &[u8], route: &ResolvedRoute) -> Vec<u8> {
-    let replacement = b"[REDACTED]";
-    let mut secrets: Vec<&str> = Vec::new();
-    if !route.api_key().is_empty() {
-        secrets.push(route.api_key());
-    }
-    secrets.extend(
+/// Scrub the upstream credential and secret-looking header values out of a logged body.
+fn mask_secrets(data: Vec<u8>, route: &ResolvedRoute) -> Vec<u8> {
+    let secrets = std::iter::once(route.api_key()).chain(
         route
             .extra_headers()
-            .map(|(_, value)| value)
-            .filter(|value| !value.is_empty()),
+            .filter(|(name, _)| is_secret_header(name))
+            .map(|(_, value)| value),
     );
-    let mut masked = data.to_vec();
-    for secret in secrets {
-        masked = replace_all(&masked, secret.as_bytes(), replacement);
-    }
-    masked
+    secrets
+        .filter(|secret| secret.len() >= MIN_MASKED_SECRET)
+        .fold(data, |data, secret| {
+            replace_all(data, secret.as_bytes(), b"[REDACTED]")
+        })
 }
 
-fn replace_all(data: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
-    if needle.is_empty() {
-        return data.to_vec();
+/// Replace every occurrence of `needle`; the input is returned untouched when absent.
+fn replace_all(data: Vec<u8>, needle: &[u8], replacement: &[u8]) -> Vec<u8> {
+    let finder = memmem::Finder::new(needle);
+    let mut matches = finder.find_iter(&data).peekable();
+    if matches.peek().is_none() {
+        return data;
     }
     let mut out = Vec::with_capacity(data.len());
     let mut index = 0;
-    while let Some(offset) = data[index..]
-        .windows(needle.len())
-        .position(|window| window == needle)
-    {
-        out.extend_from_slice(&data[index..index + offset]);
+    for offset in matches {
+        out.extend_from_slice(&data[index..offset]);
         out.extend_from_slice(replacement);
-        index += offset + needle.len();
+        index = offset + needle.len();
     }
     out.extend_from_slice(&data[index..]);
     out
 }
 
-/// Agents are cheap to clone but expensive to build, so cache one per upstream timeout.
-fn agent_for(timeout_ms: u64) -> Agent {
-    static AGENTS: OnceLock<Mutex<HashMap<u64, Agent>>> = OnceLock::new();
+/// Agents are cheap to clone but expensive to build, so cache one per timeout and mode.
+///
+/// Non-stream calls are bounded end to end by the provider timeout. Streams only have to
+/// deliver their response headers within it; the body may then run for `STREAM_TIMEOUT`.
+fn agent_for(timeout: Duration, stream: bool) -> Agent {
+    static AGENTS: OnceLock<Mutex<HashMap<(Duration, bool), Agent>>> = OnceLock::new();
     let pool = AGENTS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut agents = pool.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(agent) = agents.get(&timeout_ms) {
+    if let Some(agent) = agents.get(&(timeout, stream)) {
         return agent.clone();
     }
-    let timeout = Duration::from_millis(timeout_ms.max(100));
-    let agent = Agent::config_builder()
+    let timeout = timeout.max(Duration::from_millis(100));
+    let builder = Agent::config_builder()
         .http_status_as_error(false)
         .max_redirects(0)
         .timeout_connect(Some(timeout.min(Duration::from_secs(10))))
-        .timeout_global(Some(timeout))
         .user_agent(ureq::config::AutoHeaderValue::None)
         .accept(ureq::config::AutoHeaderValue::None)
-        .accept_encoding(ureq::config::AutoHeaderValue::None)
-        .build()
-        .new_agent();
-    agents.insert(timeout_ms, agent.clone());
+        .accept_encoding(ureq::config::AutoHeaderValue::None);
+    let builder = if stream {
+        builder
+            .timeout_send_request(Some(timeout))
+            .timeout_send_body(Some(timeout))
+            .timeout_recv_response(Some(timeout))
+            .timeout_recv_body(Some(STREAM_TIMEOUT))
+    } else {
+        builder.timeout_global(Some(timeout))
+    };
+    let agent = builder.build().new_agent();
+    agents.insert((timeout, stream), agent.clone());
     agent
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replace_all_handles_repeats_and_absence() {
+        assert_eq!(
+            replace_all(b"a-xx-b-xx".to_vec(), b"xx", b"[R]"),
+            b"a-[R]-b-[R]"
+        );
+        assert_eq!(replace_all(b"nothing".to_vec(), b"xx", b"[R]"), b"nothing");
+    }
+
+    #[test]
+    fn redact_hides_nested_secret_fields() {
+        let mut value =
+            serde_json::json!({ "a": { "API_KEY": "k", "keep": [ { "password": 1 } ] } });
+        redact(&mut value);
+        assert_eq!(
+            value,
+            serde_json::json!({ "a": { "API_KEY": "[REDACTED]", "keep": [ { "password": "[REDACTED]" } ] } })
+        );
+    }
+
+    #[test]
+    fn upstream_body_swaps_the_model_without_reordering() {
+        let mut payload = serde_json::json!({ "model": "public", "messages": [] });
+        let Value::Object(map) = &mut payload else {
+            unreachable!()
+        };
+        let body = upstream_body(map, "upstream");
+        assert_eq!(body, br#"{"model":"upstream","messages":[]}"#);
+        assert_eq!(
+            payload["model"], "public",
+            "the logged payload keeps the client model"
+        );
+    }
 }

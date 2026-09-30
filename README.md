@@ -33,6 +33,8 @@ export LLM_PROXY_MASTER_KEY='a-long-local-secret'
 
 `LLM_PROXY_MASTER_KEY` 用于加密 SQLite 中的上游 API Key；更换它会导致已有密钥无法解密，需要重新录入上游密钥。
 
+调用日志默认保留最近 30 天（含当天），更早的 `data/logs/YYYY-MM-DD.jsonl` 会在启动时和跨天后自动删除。可用 `LLM_PROXY_LOG_RETENTION_DAYS` 调整，设为 `0` 表示永久保留。
+
 ## 配置流程
 
 1. 在“上游服务”中填写完整的 `chat/completions` 地址、认证方式、API Key、额外请求头和超时。
@@ -48,7 +50,9 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"你好"}],"stream":true}'
 ```
 
-`stream=true` 时，SSE 数据会边读边转发；非流式响应会转发上游状态码和正文。调用记录按天写到 `data/logs/YYYY-MM-DD.jsonl`，可分别控制请求和响应正文是否入日志，正文有大小上限。
+`stream=true` 时，SSE 数据会边读边转发；非流式响应会转发上游状态码和正文。调用记录按天写到 `data/logs/YYYY-MM-DD.jsonl`，可分别控制请求和响应正文是否入日志，正文有大小上限（截断时不会切断多字节字符，中文仍按 UTF-8 文本保存）。
+
+上游服务的“超时”对非流式请求是整次调用的上限；对流式请求只限制上游返回响应头的时间，之后的 SSE 正文最长可持续 1 小时，长输出不会被中途截断。客户端请求头须在 15 秒内、请求体须在 60 秒内完整发送，否则连接会被关闭。
 
 上游服务和模型映射的表单只在点击“新增/编辑”时以弹框形式出现；“调用日志”的查看弹框会直接展示格式化后的入参（客户端请求正文）与出参（上游响应正文），附带字节数、编码和截断提示，未开启正文记录时显示原因，底部仍保留完整日志 JSON 供排查。
 
@@ -61,10 +65,13 @@ POST           /api/admin/providers/{id}/test
 GET/POST       /api/admin/model-routes
 GET/PUT/DELETE /api/admin/model-routes/{id}
 GET            /api/admin/logs?date=YYYY-MM-DD&q=keyword&limit=100
+GET            /api/admin/logs/{request_id}?date=YYYY-MM-DD
 GET            /api/admin/access
 GET            /v1/models
 GET            /healthz
 ```
+
+日志列表只返回摘要字段（不含 `request`/`response` 正文），完整记录通过 `/api/admin/logs/{request_id}` 按需获取。
 
 上游服务需要兼容 OpenAI `chat/completions` 请求和 SSE 响应格式。认证和管理接口应放在 HTTPS 或受保护的内网中；SQLite、密钥文件和日志目录会尝试设置为仅当前用户可读写。
 
@@ -100,6 +107,8 @@ docker build -t llm-proxy:local .
 ```
 
 ## 发布
+
+`.github/workflows/ci.yml` 在每次 push 和 PR 时执行格式检查、clippy 和测试。
 
 `.github/workflows/release.yml` 在推送 tag 时先用 Rust 工具链执行 `cargo fmt --all --check`、`cargo clippy --all-targets -- -D warnings` 和 `cargo test`，然后在 runner 上用 `gcc-aarch64-linux-gnu` 原生交叉编译出 `x86_64` 与 `aarch64` 的 release 二进制，最后由 buildx 按架构打包并推送多架构镜像；Dockerfile 不执行目标架构命令，因此整个镜像打包过程无需 QEMU。编译产物通过 `Swatinem/rust-cache` 在 tag 推送时也会保存（`save-if: true`），连续发布可以复用依赖构建结果。GHCR 使用工作流的 `GITHUB_TOKEN`；阿里云使用仓库 Secrets `ALIYUN_REGISTRY_USERNAME` 和 `ALIYUN_REGISTRY_PASSWORD`。沿用 `diting` 设置，关闭 provenance 以兼容阿里云 ACR 个人版。
 

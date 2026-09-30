@@ -4,7 +4,7 @@
 //! without chunked encoding, exactly like the Python service did.
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use subtle::ConstantTimeEq;
@@ -58,9 +58,32 @@ impl Request {
     }
 }
 
+/// A socket reader bounded by an overall deadline instead of a per-read timeout, so a peer
+/// trickling one byte at a time cannot hold a worker past the deadline.
+struct DeadlineReader {
+    stream: TcpStream,
+    deadline: Option<Instant>,
+}
+
+impl Read for DeadlineReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(deadline) = self.deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "read deadline exceeded",
+                ));
+            }
+            self.stream.set_read_timeout(Some(remaining))?;
+        }
+        self.stream.read(buf)
+    }
+}
+
 /// One accepted connection: a buffered reader plus a cloned writer handle for the same socket.
 pub struct Conn {
-    reader: BufReader<TcpStream>,
+    reader: BufReader<DeadlineReader>,
     writer: TcpStream,
     pub request_id: String,
     sent: bool,
@@ -70,16 +93,24 @@ impl Conn {
     pub fn new(stream: TcpStream, request_id: String) -> io::Result<Self> {
         let writer = stream.try_clone()?;
         Ok(Self {
-            reader: BufReader::new(stream),
+            reader: BufReader::new(DeadlineReader {
+                stream,
+                deadline: None,
+            }),
             writer,
             request_id,
             sent: false,
         })
     }
 
-    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-        self.reader.get_ref().set_read_timeout(timeout)?;
-        self.writer.set_read_timeout(timeout)
+    /// Bound all further reads by `timeout` in total; `None` removes the bound.
+    pub fn set_read_deadline(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        let reader = self.reader.get_mut();
+        reader.deadline = timeout.map(|timeout| Instant::now() + timeout);
+        if reader.deadline.is_none() {
+            reader.stream.set_read_timeout(None)?;
+        }
+        Ok(())
     }
 
     pub fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
@@ -152,28 +183,30 @@ impl Conn {
         }))
     }
 
-    /// Read and parse a JSON object body, applying the same limits as the Python service.
-    pub fn read_json(&mut self, request: &Request, max_body: usize) -> Result<Value> {
+    /// Read a `Content-Length` delimited JSON body within `timeout`, returning the raw bytes.
+    pub fn read_body(
+        &mut self,
+        request: &Request,
+        max_body: usize,
+        timeout: Duration,
+    ) -> Result<Vec<u8>> {
         if request.header("transfer-encoding").is_some() {
             return Err(ApiError::bad(
                 "chunked request bodies are not supported; send Content-Length",
             ));
         }
-        let lengths: Vec<&str> = request.header_values("content-length").collect();
-        if lengths.len() != 1 || !lengths[0].bytes().all(|b| b.is_ascii_digit()) {
-            return Err(ApiError::new(
-                411,
-                "a single valid Content-Length is required",
-                "invalid_request",
-            ));
-        }
-        let length: usize = lengths[0].parse().map_err(|_| {
+        let invalid_length = || {
             ApiError::new(
                 411,
                 "a single valid Content-Length is required",
                 "invalid_request",
             )
-        })?;
+        };
+        let lengths: Vec<&str> = request.header_values("content-length").collect();
+        if lengths.len() != 1 || !lengths[0].bytes().all(|b| b.is_ascii_digit()) {
+            return Err(invalid_length());
+        }
+        let length: usize = lengths[0].parse().map_err(|_| invalid_length())?;
         if length > max_body {
             return Err(ApiError::new(
                 413,
@@ -188,22 +221,32 @@ impl Conn {
                 "invalid_request",
             ));
         }
+        self.set_read_deadline(Some(timeout))?;
         let mut body = Vec::with_capacity(length.min(64 * 1024));
-        let mut taken = self.reader.by_ref().take(length as u64);
-        match taken.read_to_end(&mut body) {
-            Ok(read) if read == length => {}
-            Ok(_) => return Err(ApiError::bad("incomplete request body")),
+        let read = self
+            .reader
+            .by_ref()
+            .take(length as u64)
+            .read_to_end(&mut body);
+        // Nothing else is read from the client, so later long-running streams are unbounded.
+        self.set_read_deadline(None)?;
+        match read {
+            Ok(read) if read == length => Ok(body),
             Err(err) if is_timeout(&err) => {
-                return Err(ApiError::new(408, "request body timeout", "timeout"));
+                Err(ApiError::new(408, "request body timeout", "timeout"))
             }
-            Err(_) => return Err(ApiError::bad("incomplete request body")),
+            _ => Err(ApiError::bad("incomplete request body")),
         }
-        let value: Value =
-            serde_json::from_slice(&body).map_err(|_| ApiError::bad("invalid JSON"))?;
-        match value {
-            Value::Object(_) => Ok(value),
-            _ => Err(ApiError::bad("request body must be a JSON object")),
-        }
+    }
+
+    /// Read and parse a JSON object body.
+    pub fn read_json(
+        &mut self,
+        request: &Request,
+        max_body: usize,
+        timeout: Duration,
+    ) -> Result<Value> {
+        parse_object(&self.read_body(request, max_body, timeout)?)
     }
 
     /// Write a complete response with a known body length.
@@ -215,24 +258,7 @@ impl Conn {
         cache: &str,
         extra: &[(String, String)],
     ) -> io::Result<()> {
-        if self.sent {
-            return Ok(());
-        }
-        let mut buffer = Vec::with_capacity(320 + body.len());
-        head(
-            &mut buffer,
-            &self.request_id,
-            status,
-            content_type,
-            cache,
-            Some(body.len()),
-            extra,
-        );
-        buffer.extend_from_slice(body);
-        self.writer.write_all(&buffer)?;
-        self.writer.flush()?;
-        self.sent = true;
-        Ok(())
+        self.respond(status, content_type, cache, Some(body.len()), extra, body)
     }
 
     pub fn send_json(&mut self, status: u16, value: &Value) -> io::Result<()> {
@@ -250,23 +276,7 @@ impl Conn {
 
     /// Status without a body, e.g. `204 No Content`.
     pub fn send_empty(&mut self, status: u16) -> io::Result<()> {
-        if self.sent {
-            return Ok(());
-        }
-        let mut buffer = Vec::with_capacity(320);
-        head(
-            &mut buffer,
-            &self.request_id,
-            status,
-            "",
-            "no-store",
-            None,
-            &[],
-        );
-        self.writer.write_all(&buffer)?;
-        self.writer.flush()?;
-        self.sent = true;
-        Ok(())
+        self.respond(status, "", "no-store", None, &[], &[])
     }
 
     pub fn send_error(&mut self, error: &ApiError) -> io::Result<()> {
@@ -290,10 +300,23 @@ impl Conn {
         content_length: Option<usize>,
         extra: &[(String, String)],
     ) -> io::Result<()> {
+        self.respond(status, content_type, cache, content_length, extra, &[])
+    }
+
+    /// Write the head and any initial body in a single write; later calls are ignored.
+    fn respond(
+        &mut self,
+        status: u16,
+        content_type: &str,
+        cache: &str,
+        content_length: Option<usize>,
+        extra: &[(String, String)],
+        body: &[u8],
+    ) -> io::Result<()> {
         if self.sent {
             return Ok(());
         }
-        let mut buffer = Vec::with_capacity(320);
+        let mut buffer = Vec::with_capacity(320 + body.len());
         head(
             &mut buffer,
             &self.request_id,
@@ -303,6 +326,7 @@ impl Conn {
             content_length,
             extra,
         );
+        buffer.extend_from_slice(body);
         self.writer.write_all(&buffer)?;
         self.writer.flush()?;
         self.sent = true;
@@ -317,6 +341,15 @@ impl Conn {
     pub fn close(&mut self) {
         let _ = self.writer.flush();
         let _ = self.writer.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+/// Parse a body that must be a JSON object.
+pub fn parse_object(body: &[u8]) -> Result<Value> {
+    let value: Value = serde_json::from_slice(body).map_err(|_| ApiError::bad("invalid JSON"))?;
+    match value {
+        Value::Object(_) => Ok(value),
+        _ => Err(ApiError::bad("request body must be a JSON object")),
     }
 }
 
@@ -418,13 +451,13 @@ pub fn percent_decode(value: &str) -> String {
     while index < bytes.len() {
         match bytes[index] {
             b'%' if index + 2 < bytes.len() => {
-                let hex = &value[index + 1..index + 3];
-                match u8::from_str_radix(hex, 16) {
-                    Ok(byte) => {
-                        out.push(byte);
+                // Work on bytes: the characters after `%` may be multi-byte UTF-8.
+                match (hex_digit(bytes[index + 1]), hex_digit(bytes[index + 2])) {
+                    (Some(high), Some(low)) => {
+                        out.push(high << 4 | low);
                         index += 3;
                     }
-                    Err(_) => {
+                    _ => {
                         out.push(b'%');
                         index += 1;
                     }
@@ -441,4 +474,22 @@ pub fn percent_decode(value: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).to_string()
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    (byte as char).to_digit(16).map(|digit| digit as u8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::percent_decode;
+
+    #[test]
+    fn percent_decoding_handles_escapes_and_non_ascii() {
+        assert_eq!(percent_decode("a%20b+c"), "a b c");
+        assert_eq!(percent_decode("%E4%B8%AD"), "中");
+        assert_eq!(percent_decode("%中文"), "%中文");
+        assert_eq!(percent_decode("%4"), "%4");
+        assert_eq!(percent_decode("%zz"), "%zz");
+    }
 }
